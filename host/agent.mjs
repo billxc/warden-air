@@ -554,7 +554,7 @@ class DesktopBiometricBridge {
       };
     }
 
-    if (!forceCreate && username) {
+    if (!forceCreate) {
       const candidate = list.find(
         (c) =>
           (c.userName ?? "") === username &&

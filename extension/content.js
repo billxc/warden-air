@@ -850,6 +850,7 @@
     resetAutoClose();
 
     let saving = false;
+    let primaryBtn = saveBtn;
     async function performSave(extra = {}) {
       if (saving) return;
       saving = true;
@@ -857,7 +858,7 @@
       hintEl.hidden = true;
       hintEl.className = "hint";
       for (const b of actions.querySelectorAll("button")) b.disabled = true;
-      saveBtn.textContent = "Bitwarden…";
+      primaryBtn.textContent = "Bitwarden…";
 
       const slowHintTimer = setTimeout(() => {
         if (saving) {
@@ -881,7 +882,7 @@
       if (!res?.ok) {
         saving = false;
         for (const b of actions.querySelectorAll("button")) b.disabled = false;
-        saveBtn.textContent = extra.updateCredentialId ? "Update" : "Save";
+        primaryBtn.textContent = extra.updateCredentialId ? "Update" : "Save";
         hintEl.className = "hint";
         hintEl.textContent = formatSaveError(res?.error);
         hintEl.hidden = false;
@@ -904,15 +905,17 @@
           performSave({ forceCreate: true });
         });
 
-        saveBtn.disabled = false;
-        saveBtn.textContent = "Update";
-        const updateClone = saveBtn.cloneNode(true);
-        updateClone.addEventListener("click", (ev) => {
+        const updateBtn = document.createElement("button");
+        updateBtn.className = "btn primary";
+        updateBtn.type = "button";
+        updateBtn.textContent = "Update";
+        updateBtn.addEventListener("click", (ev) => {
           if (!ev.isTrusted) return;
           performSave({ updateCredentialId: res.candidate.credentialId });
         });
+        primaryBtn = updateBtn;
 
-        actions.append(newBtn, updateClone);
+        actions.append(newBtn, updateBtn);
         resetAutoClose();
         return;
       }
