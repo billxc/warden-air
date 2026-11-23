@@ -265,7 +265,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!sender.tab?.id || !frameUrl || !/^https?:/i.test(frameUrl)) {
           return { ok: false, error: "unsupported_url" };
         }
-        return await callHost("getLogins", { uri: frameUrl, metadataOnly: true });
+        return await callHost("getLogins", {
+          uri: frameUrl,
+          metadataOnly: true,
+          passive: true,
+        });
       }
 
       case "content-unlock": {

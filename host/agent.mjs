@@ -15,8 +15,10 @@ import {
   setStoredDesktopSharedKey,
 } from "./paths.mjs";
 import {
+  VaultUriCache,
   decryptSymString,
   encryptSymEncString,
+  isAutofillEligibleUrl,
   queryLocalVaultForUrl,
   readAccountsFromLocalStore,
   resolveBitwardenDataFile,
@@ -31,6 +33,8 @@ const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 
 // In-memory only: userId -> { key: Buffer, unlockedAt: number }
 const unlockedKeys = new Map();
+// Long-lived in-memory URI rule index (no usernames/passwords; survives wipeAllKeys)
+const vaultUriCache = new VaultUriCache();
 let unlockInFlight = null;
 let pendingTimer = null;
 let lockEpoch = 0;
@@ -305,6 +309,9 @@ class DesktopBiometricBridge {
                   return;
                 }
                 storeUnlockedKey(userId, userKeyBuf);
+                try {
+                  vaultUriCache.refreshFromVault(userId, userKeyBuf);
+                } catch {}
                 resolve(userKeyBuf);
               } else {
                 falseCount += 1;
@@ -518,6 +525,7 @@ class DesktopBiometricBridge {
       (c) => (c.userName ?? "") === username && (c.password ?? "") === password,
     );
     if (exactDup) {
+      vaultUriCache.recordSavedUri(active.id, canonicalUri);
       return { status: "unchanged", credentialId: exactDup.credentialId, email: active.email };
     }
 
@@ -532,6 +540,7 @@ class DesktopBiometricBridge {
       if (!chosen) {
         throw new Error("update_target_unavailable");
       }
+      const updatedUri = `${targetUrl.origin}/`;
       const res = await this.sendDesktopCommand(
         "bw-credential-update",
         {
@@ -540,13 +549,14 @@ class DesktopBiometricBridge {
           name: chosen.name || targetUrl.host,
           userName: username,
           password,
-          uri: `${targetUrl.origin}/`,
+          uri: updatedUri,
         },
         30_000,
       );
       if (res?.status !== "success") {
         throw new Error(res?.error || "desktop_update_failed");
       }
+      vaultUriCache.recordSavedUri(active.id, updatedUri);
       return {
         status: "updated",
         credentialId: chosen.credentialId,
@@ -587,6 +597,7 @@ class DesktopBiometricBridge {
     if (res?.status !== "success") {
       throw new Error(res?.error || "desktop_create_failed");
     }
+    vaultUriCache.recordSavedUri(active.id, canonicalUri);
     return { status: "created", email: active.email };
   }
 }
@@ -672,12 +683,18 @@ async function handleAction(req) {
       }
 
       case "getLogins": {
+        if (req.passive && !isAutofillEligibleUrl(req.uri)) {
+          return { id, ok: true, items: [] };
+        }
         const { active } = getStatusSnapshot();
         if (!active) {
           return { id, ok: false, error: "no_account" };
         }
         const userKey = peekUnlockedKey(active.id);
         if (!userKey) {
+          if (req.passive && !vaultUriCache.hasMatch(active.id, req.uri)) {
+            return { id, ok: true, email: active.email, items: [] };
+          }
           return {
             id,
             ok: false,

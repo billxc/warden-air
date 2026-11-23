@@ -420,8 +420,41 @@
     panel.appendChild(row);
   }
 
+  function isPrivateOrLocalHost(hostname) {
+    const h = hostname.toLowerCase();
+    if (!h) return false;
+    if (h.startsWith("[")) {
+      return h === "[::1]" || /^\[f[cd][0-9a-f]{2}:/.test(h) || /^\[fe80:/.test(h);
+    }
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) {
+      return (
+        /^127\./.test(h) ||
+        /^10\./.test(h) ||
+        /^192\.168\./.test(h) ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
+        /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(h)
+      );
+    }
+    return (
+      !h.includes(".") ||
+      h.endsWith(".local") ||
+      h.endsWith(".lan") ||
+      h.endsWith(".internal") ||
+      h.endsWith(".home.arpa")
+    );
+  }
+
+  function isAutofillEligiblePage() {
+    if (window.location.protocol === "https:") return true;
+    if (window.location.protocol === "http:") {
+      return isPrivateOrLocalHost(window.location.hostname);
+    }
+    return false;
+  }
+
   async function inspectInput(el) {
     if (suppressFocus) return;
+    if (!isAutofillEligiblePage()) return;
     if (!isVisibleEditableInput(el)) return;
     if (looksLikeSearchOrOtp(el)) return;
 

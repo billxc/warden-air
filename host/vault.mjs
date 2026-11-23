@@ -163,7 +163,7 @@ const SHARED_HOSTING_SUFFIXES = [
   "blob.core.windows.net",
 ];
 
-function getBaseDomain(hostname) {
+export function getBaseDomain(hostname) {
   const host = hostname.toLowerCase();
   if (
     host.startsWith("[") ||
@@ -189,23 +189,40 @@ function getBaseDomain(hostname) {
   return lastTwo;
 }
 
-function isPrivateOrLocalHost(hostname) {
+export function isPrivateOrLocalHost(hostname) {
   const h = hostname.toLowerCase();
+  if (!h) return false;
+  if (h.startsWith("[")) {
+    return h === "[::1]" || /^\[f[cd][0-9a-f]{2}:/.test(h) || /^\[fe80:/.test(h);
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) {
+    return (
+      /^127\./.test(h) ||
+      /^10\./.test(h) ||
+      /^192\.168\./.test(h) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
+      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(h)
+    );
+  }
   return (
-    h === "localhost" ||
-    h === "[::1]" ||
-    /^\[f[cd][0-9a-f]{2}:/.test(h) ||
-    /^\[fe80:/.test(h) ||
+    !h.includes(".") ||
     h.endsWith(".local") ||
     h.endsWith(".lan") ||
     h.endsWith(".internal") ||
-    h.endsWith(".home.arpa") ||
-    /^127\./.test(h) ||
-    /^10\./.test(h) ||
-    /^192\.168\./.test(h) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
-    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(h)
+    h.endsWith(".home.arpa")
   );
+}
+
+export function isAutofillEligibleUrl(rawUrl) {
+  let u;
+  try {
+    u = rawUrl instanceof URL ? rawUrl : new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (u.protocol === "https:") return true;
+  if (u.protocol === "http:") return isPrivateOrLocalHost(u.hostname);
+  return false;
 }
 
 // Match rank: 5 = exact URL, 4 = exact host+port, 3 = same hostname (different port), 2 = base domain, 0 = no match
@@ -341,6 +358,43 @@ export function generateTotpCode(totpRaw) {
   }
 }
 
+function createOrgKeyResolver(store, userId, userKeyBuf) {
+  const cryptoState = store[`user_${userId}_crypto_accountCryptographicState`];
+  const encPrivKey =
+    cryptoState?.V2?.private_key ||
+    cryptoState?.V1?.private_key ||
+    store[`user_${userId}_crypto_privateKey`];
+  const encOrgKeys = store[`user_${userId}_crypto_organizationKeys`] || {};
+
+  let privKeyDer = null;
+  const orgKeyCache = new Map();
+
+  return {
+    getOrgKey(orgId) {
+      if (orgKeyCache.has(orgId)) return orgKeyCache.get(orgId);
+      try {
+        if (!privKeyDer && encPrivKey) {
+          privKeyDer = decryptSymBytes(encPrivKey, userKeyBuf);
+        }
+        const entry = encOrgKeys[orgId];
+        const rawEncKey = typeof entry === "string" ? entry : entry?.key;
+        const orgKey = rawEncKey && privKeyDer ? decryptRsaBytes(rawEncKey, privKeyDer) : null;
+        orgKeyCache.set(orgId, orgKey);
+        return orgKey;
+      } catch {
+        orgKeyCache.set(orgId, null);
+        return null;
+      }
+    },
+    wipe() {
+      if (privKeyDer) privKeyDer.fill(0);
+      for (const [, orgKey] of orgKeyCache) {
+        if (orgKey) orgKey.fill(0);
+      }
+    },
+  };
+}
+
 export function queryLocalVaultForUrl(userId, userKeyBuf, targetUri, options = {}) {
   const { metadataOnly = false, credentialIdFilter = null } = options;
 
@@ -360,103 +414,82 @@ export function queryLocalVaultForUrl(userId, userKeyBuf, targetUri, options = {
   const ciphersMap = store[`user_${userId}_ciphers_ciphers`] || {};
   const localDataMap = store[`user_${userId}_ciphersLocal_localData`] || {};
   const defaultMatch = store[`user_${userId}_domainSettings_defaultUriMatchStrategy`] ?? 0;
-  const cryptoState = store[`user_${userId}_crypto_accountCryptographicState`];
-  const encPrivKey =
-    cryptoState?.V2?.private_key ||
-    cryptoState?.V1?.private_key ||
-    store[`user_${userId}_crypto_privateKey`];
-  const encOrgKeys = store[`user_${userId}_crypto_organizationKeys`] || {};
-
-  let privKeyDer = null;
-  const orgKeyCache = new Map();
-
-  function getOrgKey(orgId) {
-    if (orgKeyCache.has(orgId)) return orgKeyCache.get(orgId);
-    try {
-      if (!privKeyDer && encPrivKey) {
-        privKeyDer = decryptSymBytes(encPrivKey, userKeyBuf);
-      }
-      const entry = encOrgKeys[orgId];
-      const rawEncKey = typeof entry === "string" ? entry : entry?.key;
-      const orgKey = rawEncKey && privKeyDer ? decryptRsaBytes(rawEncKey, privKeyDer) : null;
-      orgKeyCache.set(orgId, orgKey);
-      return orgKey;
-    } catch {
-      orgKeyCache.set(orgId, null);
-      return null;
-    }
-  }
+  const orgKeys = createOrgKeyResolver(store, userId, userKeyBuf);
 
   const matches = [];
 
-  for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
-    if (credentialIdFilter && cipherId !== credentialIdFilter) continue;
-    if (
-      !cipher ||
-      cipher.deletedDate != null ||
-      cipher.type !== 1 ||
-      cipher.reprompt ||
-      !cipher.login?.uris?.length
-    ) {
-      continue;
-    }
-
-    const baseKey = cipher.organizationId ? getOrgKey(cipher.organizationId) : userKeyBuf;
-    if (!baseKey) continue;
-
-    let itemKey = baseKey;
-    if (cipher.key) {
-      try {
-        itemKey = decryptSymBytes(cipher.key, baseKey);
-      } catch {
+  try {
+    for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
+      if (credentialIdFilter && cipherId !== credentialIdFilter) continue;
+      if (
+        !cipher ||
+        cipher.deletedDate != null ||
+        cipher.type !== 1 ||
+        cipher.reprompt ||
+        !cipher.login?.uris?.length
+      ) {
         continue;
       }
-    }
-    if (!itemKey) continue;
 
-    let bestScore = 0;
-    for (const u of cipher.login.uris) {
-      if (!u?.uri) continue;
+      const baseKey = cipher.organizationId ? orgKeys.getOrgKey(cipher.organizationId) : userKeyBuf;
+      if (!baseKey) continue;
+
+      let itemKey = baseKey;
+      if (cipher.key) {
+        try {
+          itemKey = decryptSymBytes(cipher.key, baseKey);
+        } catch {
+          continue;
+        }
+      }
+      if (!itemKey) continue;
+
+      let bestScore = 0;
+      for (const u of cipher.login.uris) {
+        if (!u?.uri) continue;
+        try {
+          const plainUri = decryptSymString(u.uri, itemKey);
+          const score = matchUriScore(targetUrl, plainUri, u.match ?? defaultMatch);
+          if (score > bestScore) bestScore = score;
+        } catch {}
+      }
+
+      if (bestScore === 0) continue;
+
       try {
-        const plainUri = decryptSymString(u.uri, itemKey);
-        const score = matchUriScore(targetUrl, plainUri, u.match ?? defaultMatch);
-        if (score > bestScore) bestScore = score;
+        const name = decryptSymString(cipher.name, itemKey) || "";
+        const userName = decryptSymString(cipher.login.username, itemKey) || "";
+        const totpRaw = decryptSymString(cipher.login.totp, itemKey);
+        const lastUsedDate = localDataMap[cipherId]?.lastUsedDate || 0;
+
+        if (metadataOnly) {
+          matches.push({
+            credentialId: cipherId,
+            userId,
+            name,
+            userName,
+            hasTotp: generateTotpCode(totpRaw) != null,
+            _score: bestScore,
+            _lastUsed: Number(lastUsedDate) || 0,
+          });
+        } else {
+          const password = decryptSymString(cipher.login.password, itemKey) || "";
+          const totp = generateTotpCode(totpRaw);
+          matches.push({
+            credentialId: cipherId,
+            userId,
+            name,
+            userName,
+            password,
+            totp,
+            _score: bestScore,
+            _lastUsed: Number(lastUsedDate) || 0,
+          });
+        }
       } catch {}
     }
-
-    if (bestScore === 0) continue;
-
-    try {
-      const name = decryptSymString(cipher.name, itemKey) || "";
-      const userName = decryptSymString(cipher.login.username, itemKey) || "";
-      const totpRaw = decryptSymString(cipher.login.totp, itemKey);
-      const lastUsedDate = localDataMap[cipherId]?.lastUsedDate || 0;
-
-      if (metadataOnly) {
-        matches.push({
-          credentialId: cipherId,
-          userId,
-          name,
-          userName,
-          hasTotp: generateTotpCode(totpRaw) != null,
-          _score: bestScore,
-          _lastUsed: Number(lastUsedDate) || 0,
-        });
-      } else {
-        const password = decryptSymString(cipher.login.password, itemKey) || "";
-        const totp = generateTotpCode(totpRaw);
-        matches.push({
-          credentialId: cipherId,
-          userId,
-          name,
-          userName,
-          password,
-          totp,
-          _score: bestScore,
-          _lastUsed: Number(lastUsedDate) || 0,
-        });
-      }
-    } catch {}
+  } finally {
+    orgKeys.wipe();
   }
 
   matches.sort((a, b) => {
@@ -466,4 +499,168 @@ export function queryLocalVaultForUrl(userId, userKeyBuf, targetUri, options = {
   });
 
   return matches.map(({ _score, _lastUsed, ...item }) => item);
+}
+
+function isIndexableCipherUri(plainUri, effectiveMatchType) {
+  if (!plainUri || effectiveMatchType === 5) return false;
+  if (effectiveMatchType === 4) {
+    try {
+      new RegExp(plainUri, "i");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const hasExplicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(plainUri);
+  return isAutofillEligibleUrl(hasExplicitScheme ? plainUri : `https://${plainUri}`);
+}
+
+function isEligiblePasswordCipher(cipher) {
+  return Boolean(
+    cipher &&
+      cipher.deletedDate == null &&
+      cipher.type === 1 &&
+      !cipher.reprompt &&
+      cipher.login?.password &&
+      cipher.login?.uris?.length,
+  );
+}
+
+export class VaultUriCache {
+  #byUser = new Map();
+  #resolveDataFile;
+
+  constructor({ dataFileResolver = resolveBitwardenDataFile } = {}) {
+    this.#resolveDataFile = dataFileResolver;
+  }
+
+  refreshFromVault(userId, userKeyBuf) {
+    const dataFile = this.#resolveDataFile();
+    if (!dataFile) return;
+
+    const mtimeMs = fs.statSync(dataFile).mtimeMs;
+    const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+    const ciphersMap = store[`user_${userId}_ciphers_ciphers`] || {};
+    const defaultMatch = store[`user_${userId}_domainSettings_defaultUriMatchStrategy`] ?? 0;
+    const orgKeys = createOrgKeyResolver(store, userId, userKeyBuf);
+
+    const cipherRules = new Map();
+
+    try {
+      for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
+        if (!isEligiblePasswordCipher(cipher)) continue;
+
+        const baseKey = cipher.organizationId ? orgKeys.getOrgKey(cipher.organizationId) : userKeyBuf;
+        if (!baseKey) continue;
+
+        let itemKey = baseKey;
+        let ownsItemKey = false;
+        if (cipher.key) {
+          try {
+            itemKey = decryptSymBytes(cipher.key, baseKey);
+            ownsItemKey = Boolean(itemKey);
+          } catch {
+            continue;
+          }
+        }
+        if (!itemKey) continue;
+
+        try {
+          const rules = [];
+          for (const u of cipher.login.uris) {
+            if (!u?.uri) continue;
+            try {
+              const plainUri = decryptSymString(u.uri, itemKey);
+              const match = u.match ?? defaultMatch;
+              if (isIndexableCipherUri(plainUri, match)) {
+                rules.push({ uri: plainUri, match });
+              }
+            } catch {}
+          }
+          if (rules.length > 0) {
+            cipherRules.set(cipherId, rules);
+          }
+        } finally {
+          if (ownsItemKey) itemKey.fill(0);
+        }
+      }
+    } finally {
+      orgKeys.wipe();
+    }
+
+    this.#byUser.set(userId, {
+      cipherRules,
+      savedRules: new Map(),
+      lastMtimeMs: mtimeMs,
+    });
+  }
+
+  recordSavedUri(userId, rawUri) {
+    if (!userId || !isAutofillEligibleUrl(rawUri)) return;
+    let state = this.#byUser.get(userId);
+    if (!state) {
+      state = { cipherRules: new Map(), savedRules: new Map(), lastMtimeMs: -1 };
+      this.#byUser.set(userId, state);
+    }
+    const dataFile = this.#resolveDataFile();
+    let defaultMatch = 0;
+    if (dataFile) {
+      try {
+        const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+        defaultMatch = store[`user_${userId}_domainSettings_defaultUriMatchStrategy`] ?? 0;
+      } catch {}
+    }
+    state.savedRules.set(rawUri, { uri: rawUri, match: defaultMatch });
+  }
+
+  #pruneStaleCiphers(userId, state) {
+    if (state.cipherRules.size === 0) return;
+    const dataFile = this.#resolveDataFile();
+    if (!dataFile) {
+      state.cipherRules.clear();
+      return;
+    }
+    let mtimeMs;
+    try {
+      mtimeMs = fs.statSync(dataFile).mtimeMs;
+    } catch {
+      return;
+    }
+    if (mtimeMs === state.lastMtimeMs) return;
+
+    try {
+      const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+      const ciphersMap = store[`user_${userId}_ciphers_ciphers`] || {};
+      for (const cipherId of state.cipherRules.keys()) {
+        if (!isEligiblePasswordCipher(ciphersMap[cipherId])) {
+          state.cipherRules.delete(cipherId);
+        }
+      }
+      state.lastMtimeMs = mtimeMs;
+    } catch {}
+  }
+
+  hasMatch(userId, targetUri) {
+    if (!userId || !isAutofillEligibleUrl(targetUri)) return false;
+
+    const state = this.#byUser.get(userId);
+    if (!state) return false;
+
+    this.#pruneStaleCiphers(userId, state);
+
+    const targetUrl = new URL(targetUri);
+    for (const rules of state.cipherRules.values()) {
+      for (const rule of rules) {
+        if (matchUriScore(targetUrl, rule.uri, rule.match) > 0) {
+          return true;
+        }
+      }
+    }
+    for (const rule of state.savedRules.values()) {
+      if (matchUriScore(targetUrl, rule.uri, rule.match) > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
 }

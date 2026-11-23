@@ -6,7 +6,12 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { encryptSymEncString } from "../host/vault.mjs";
+import {
+  VaultUriCache,
+  encryptSymEncString,
+  isAutofillEligibleUrl,
+  isPrivateOrLocalHost,
+} from "../host/vault.mjs";
 
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const IS_WIN = process.platform === "win32";
@@ -362,6 +367,25 @@ process.stdin.on("data", (c) => {
     assert.equal(r.accounts[0].status, "locked");
   }
 
+  // 1b. Cold-start silent mode: passive content queries stay silent before first unlock, while explicit shortcut queries still report locked
+  const coldPassive = await callHost({
+    id: 5,
+    action: "getLogins",
+    uri: "https://example.com/login",
+    metadataOnly: true,
+    passive: true,
+  });
+  assert.equal(coldPassive.ok, true);
+  assert.equal(coldPassive.items.length, 0);
+
+  const coldExplicit = await callHost({
+    id: 6,
+    action: "getLogins",
+    uri: "https://example.com/login",
+  });
+  assert.equal(coldExplicit.ok, false);
+  assert.equal(coldExplicit.error, "locked");
+
   // 2. Biometric unlock + subdomain match + reprompt filter + broken TOTP isolation + metadataOnly
   const unlockRes = await callHost({
     id: 10,
@@ -397,6 +421,56 @@ process.stdin.on("data", (c) => {
   });
   assert.equal(afterSingleUse.ok, false);
   assert.equal(afterSingleUse.error, "locked");
+
+  // 3b. In-memory URI cache survives key wipe: prompts only on known HTTPS & LAN sites, stays silent on unknown or public HTTP
+  const [passiveKnownHttps, passiveKnownLan, passiveUnknown, passivePublicHttp, passiveSpoofedIp] =
+    await Promise.all([
+      callHost({
+        id: 111,
+        action: "getLogins",
+        uri: "https://app.example.com/login",
+        metadataOnly: true,
+        passive: true,
+      }),
+      callHost({
+        id: 112,
+        action: "getLogins",
+        uri: "http://100.64.0.10:9000/",
+        metadataOnly: true,
+        passive: true,
+      }),
+      callHost({
+        id: 113,
+        action: "getLogins",
+        uri: "https://no-saved-login.example.org/login",
+        metadataOnly: true,
+        passive: true,
+      }),
+      callHost({
+        id: 114,
+        action: "getLogins",
+        uri: "http://example.com/login",
+        metadataOnly: true,
+        passive: true,
+      }),
+      callHost({
+        id: 115,
+        action: "getLogins",
+        uri: "http://10.example.com/login",
+        metadataOnly: true,
+        passive: true,
+      }),
+    ]);
+  assert.equal(passiveKnownHttps.ok, false);
+  assert.equal(passiveKnownHttps.error, "locked");
+  assert.equal(passiveKnownLan.ok, false);
+  assert.equal(passiveKnownLan.error, "locked");
+  assert.equal(passiveUnknown.ok, true);
+  assert.equal(passiveUnknown.items.length, 0);
+  assert.equal(passivePublicHttp.ok, true);
+  assert.equal(passivePublicHttp.items.length, 0);
+  assert.equal(passiveSpoofedIp.ok, true);
+  assert.equal(passiveSpoofedIp.items.length, 0);
 
   // 4. Multi-tenant public suffix isolation (*.github.io) + zero-match & one-shot unlock auto-lock
   const ghEvil = await callHost({
@@ -445,11 +519,20 @@ process.stdin.on("data", (c) => {
   assert.equal(nas9000.items[0].credentialId, "c-nas-9000");
   assert.equal(nas9000.items[1].credentialId, "c-nas-5000");
 
-  // 6. Manual lock immediately revokes pending selection window
+  // 6. Manual lock immediately revokes pending selection window while preserving URI cache
   await callHost({ id: 14, action: "lock" });
   const afterLock = await callHost({ id: 15, action: "getLogins", uri: "https://example.com/" });
   assert.equal(afterLock.ok, false);
   assert.equal(afterLock.error, "locked");
+  const passiveAfterLockMiss = await callHost({
+    id: 151,
+    action: "getLogins",
+    uri: "https://unknown-after-lock.org/",
+    metadataOnly: true,
+    passive: true,
+  });
+  assert.equal(passiveAfterLockMiss.ok, true);
+  assert.equal(passiveAfterLockMiss.items.length, 0);
 
   // 7. Password save via Bitwarden Desktop IPC: concurrent cold handshake + foreground unlock wait + strict update rules
   assert.equal(fs.existsSync(desktopStateFile), false);
@@ -475,6 +558,17 @@ process.stdin.on("data", (c) => {
   assert.equal(roCreateRes.ok, true);
   assert.equal(roCreateRes.status, "created");
   assert.equal(fs.existsSync(desktopStateFile), true);
+
+  // Newly saved HTTPS site is immediately recognized by passive query while still locked (before Touch ID unlock)
+  const passiveNewlySaved = await callHost({
+    id: 21,
+    action: "getLogins",
+    uri: "https://newsite.example.org/login",
+    metadataOnly: true,
+    passive: true,
+  });
+  assert.equal(passiveNewlySaved.ok, false);
+  assert.equal(passiveNewlySaved.error, "locked");
 
   const createdFill = await callHost({
     id: 22,
@@ -555,4 +649,35 @@ process.stdin.on("data", (c) => {
   const updatedPortal = updatedFill.items.find((i) => i.credentialId === "c-portal");
   assert.equal(updatedPortal?.password, "rotated!2026");
   assert.match(updatedPortal?.totp, /^\d{6}$/);
+
+  // 8. Deleting a cipher in data.json prunes it from the in-memory URI cache on mtime change without re-unlock
+  const latestStore = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+  latestStore[`user_${userId}_ciphers_ciphers`]["c-ghio"].deletedDate = "2026-11-24T00:00:00.000Z";
+  fs.writeFileSync(dataFile, JSON.stringify(latestStore));
+  const futureTime = Date.now() / 1000 + 5;
+  fs.utimesSync(dataFile, futureTime, futureTime);
+
+  const passiveAfterDelete = await callHost({
+    id: 26,
+    action: "getLogins",
+    uri: "https://victim.github.io/app",
+    metadataOnly: true,
+    passive: true,
+  });
+  assert.equal(passiveAfterDelete.ok, true);
+  assert.equal(passiveAfterDelete.items.length, 0);
+});
+
+test("URL eligibility and VaultUriCache passwordless / public-HTTP filtering", () => {
+  assert.equal(isAutofillEligibleUrl("https://github.com/login"), true);
+  assert.equal(isAutofillEligibleUrl("http://localhost:3000/"), true);
+  assert.equal(isAutofillEligibleUrl("http://openwrt/"), true);
+  assert.equal(isAutofillEligibleUrl("http://192.168.1.1:8080/"), true);
+  assert.equal(isAutofillEligibleUrl("http://[::1]:8080/"), true);
+  assert.equal(isAutofillEligibleUrl("http://[fd00::1]/"), true);
+  assert.equal(isAutofillEligibleUrl("http://example.com/"), false);
+  assert.equal(isAutofillEligibleUrl("http://192.168.evil.org/"), false);
+  assert.equal(isAutofillEligibleUrl("http://[2606:4700:4700::1111]/"), false);
+  assert.equal(isPrivateOrLocalHost("10.attacker.com"), false);
+  assert.equal(typeof VaultUriCache, "function");
 });
