@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Warden Air",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Zero-login browser autofill with in-place Touch ID unlock.",
   "icons": {
     "16": "icons/icon-16.png",
@@ -14,7 +14,9 @@
     "nativeMessaging",
     "activeTab",
     "scripting",
-    "clipboardWrite"
+    "clipboardWrite",
+    "privacy",
+    "storage"
   ],
   "background": {
     "service_worker": "background.js",

@@ -15,8 +15,15 @@
   let activeAnchor = null;
   let hostEl = null;
   let shadow = null;
+  let saveHostEl = null;
+  let saveShadow = null;
+  let saveAutoCloseTimer = null;
+  let activeSaveCaptureId = null;
   let requestSeq = 0;
   let suppressFocus = false;
+  let lastCaptureKind = "";
+  let lastCaptureAt = 0;
+  const userEditedInputs = new WeakSet();
 
   function isFillable(el) {
     if (!(el instanceof HTMLInputElement) || el.disabled || el.readOnly) return false;
@@ -454,7 +461,7 @@
   document.addEventListener(
     "mousedown",
     (e) => {
-      if (hostEl && e.target === hostEl) return;
+      if ((hostEl && e.target === hostEl) || (saveHostEl && e.target === saveHostEl)) return;
       if (e.target instanceof HTMLInputElement && e.target === document.activeElement) {
         if (!hostEl) inspectInput(e.target);
         return;
@@ -469,12 +476,495 @@
   document.addEventListener(
     "keydown",
     (e) => {
-      if (e.key === "Escape" && hostEl) {
-        hideOverlay();
+      if (e.key === "Escape") {
+        if (hostEl) hideOverlay();
+        if (saveHostEl && e.target !== saveHostEl) dismissSaveBar(false);
+      }
+      if (e.isTrusted && e.key === "Enter" && e.target instanceof HTMLInputElement) {
+        if (!saveHostEl || e.target !== saveHostEl) {
+          captureCredentialsFromScope(e.target.form || document);
+        }
       }
     },
     true,
   );
+
+  document.addEventListener(
+    "input",
+    (e) => {
+      if (e.isTrusted && e.target instanceof HTMLInputElement) {
+        userEditedInputs.add(e.target);
+      }
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "change",
+    (e) => {
+      if (e.isTrusted && e.target instanceof HTMLInputElement) {
+        userEditedInputs.add(e.target);
+      }
+    },
+    true,
+  );
+
+  function findUsernameInScope(scope, pwdInput) {
+    const roots = scope === document ? [document] : [scope, document];
+    for (const root of roots) {
+      const visibleCandidates = [...root.querySelectorAll(USER_SELECTOR)].filter(
+        (el) =>
+          el !== pwdInput &&
+          el.type !== "password" &&
+          isFillable(el) &&
+          !looksLikeSearchOrOtp(el) &&
+          el.value.trim().length > 0,
+      );
+      if (pwdInput) {
+        let preceding = null;
+        for (const el of visibleCandidates) {
+          if (el.compareDocumentPosition(pwdInput) & Node.DOCUMENT_POSITION_FOLLOWING) {
+            preceding = el;
+          }
+        }
+        if (preceding) return preceding.value.trim();
+      }
+      if (visibleCandidates.length > 0) {
+        return visibleCandidates[0].value.trim();
+      }
+      const hiddenUser = [
+        ...root.querySelectorAll('input[autocomplete~="username"], input[type="email"]'),
+      ].find((el) => el !== pwdInput && el.type !== "password" && el.value.trim().length > 0);
+      if (hiddenUser) return hiddenUser.value.trim();
+    }
+    return "";
+  }
+
+  function looksLikeStepOneUsernameField(el) {
+    const type = (el.getAttribute("type") || "text").toLowerCase();
+    if (type === "email") return true;
+    const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
+    if (ac.includes("username") || ac.includes("email")) return true;
+    const hint = `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""}`;
+    return /\b(user|login|email|account|identifier|uid|phone|mobile)\b|账号|用户名|邮箱|手机/i.test(
+      hint,
+    );
+  }
+
+  function captureCredentialsFromScope(scope) {
+    const root = scope || document;
+    const pwds = [...root.querySelectorAll('input[type="password"]')];
+    const editedPwds = pwds.filter((el) => userEditedInputs.has(el) && el.value.length > 0);
+
+    let username = "";
+    let password = "";
+
+    if (editedPwds.length > 0) {
+      const newPwd = editedPwds.find((el) =>
+        (el.getAttribute("autocomplete") || "").toLowerCase().includes("new-password"),
+      );
+      const pwdInput = newPwd || editedPwds[editedPwds.length - 1];
+      password = pwdInput.value;
+      username = findUsernameInScope(root, pwdInput);
+    } else if (pwds.filter(isFillable).length === 0) {
+      const editedUser = [...root.querySelectorAll(USER_SELECTOR)].find(
+        (el) =>
+          userEditedInputs.has(el) &&
+          el.type !== "password" &&
+          isFillable(el) &&
+          !looksLikeSearchOrOtp(el) &&
+          looksLikeStepOneUsernameField(el) &&
+          el.value.trim().length > 0,
+      );
+      if (!editedUser) return;
+      username = editedUser.value.trim();
+    } else {
+      return;
+    }
+
+    const kind = password ? "full" : "user";
+    const now = Date.now();
+    if (kind === lastCaptureKind && now - lastCaptureAt < 250) return;
+    lastCaptureKind = kind;
+    lastCaptureAt = now;
+
+    chrome.runtime
+      .sendMessage({ type: "content-capture-submit", username, password })
+      .catch(() => {});
+  }
+
+  document.addEventListener(
+    "submit",
+    (e) => {
+      captureCredentialsFromScope(e.target instanceof HTMLFormElement ? e.target : document);
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "click",
+    (e) => {
+      if (!e.isTrusted || !(e.target instanceof Element)) return;
+      if ((hostEl && e.target === hostEl) || (saveHostEl && e.target === saveHostEl)) return;
+      const trigger = e.target.closest(
+        'button, input[type="submit"], input[type="button"], [role="button"]',
+      );
+      if (trigger) {
+        captureCredentialsFromScope(trigger.form || trigger.closest("form") || document);
+      }
+    },
+    true,
+  );
+
+  function hideSaveBar() {
+    clearTimeout(saveAutoCloseTimer);
+    saveAutoCloseTimer = null;
+    activeSaveCaptureId = null;
+    if (saveHostEl) {
+      saveHostEl.remove();
+      saveHostEl = null;
+      saveShadow = null;
+    }
+  }
+
+  function dismissSaveBar(never) {
+    const captureId = activeSaveCaptureId;
+    hideSaveBar();
+    chrome.runtime
+      .sendMessage({ type: "content-dismiss-save", captureId, never })
+      .catch(() => {});
+  }
+
+  function hasActiveEditedPasswordOnPage() {
+    return [...document.querySelectorAll('input[type="password"]')].some(
+      (el) => userEditedInputs.has(el) && el.value.length > 0 && isFillable(el),
+    );
+  }
+
+  function formatSaveError(err) {
+    if (err === "ddg_integration_disabled") {
+      return "Enable 'Allow DuckDuckGo browser integration' in Bitwarden Desktop Settings (or restart Bitwarden).";
+    }
+    if (err === "pairing_canceled") {
+      return "Connection declined in Bitwarden Desktop.";
+    }
+    if (err === "desktop_locked" || err === "desktop_ipc_timeout") {
+      return "Unlock Bitwarden Desktop and click Save again.";
+    }
+    return `Save failed: ${err || "canceled"}`;
+  }
+
+  function renderSaveBar({ captureId, host, username }) {
+    if (window !== window.top || !captureId) return;
+    hideSaveBar();
+    activeSaveCaptureId = captureId;
+
+    saveHostEl = document.createElement("div");
+    saveHostEl.setAttribute("data-warden-air-save", "1");
+    Object.assign(saveHostEl.style, {
+      position: "fixed",
+      zIndex: "2147483647",
+      top: "12px",
+      right: "12px",
+      pointerEvents: "auto",
+    });
+
+    saveShadow = saveHostEl.attachShadow({ mode: "closed" });
+    const style = document.createElement("style");
+    style.textContent = `
+      :host { all: initial; }
+      .card {
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        width: 288px;
+        background: #1c1f26;
+        color: #f3f4f6;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 11px;
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
+        padding: 11px 12px;
+        box-sizing: border-box;
+      }
+      .head {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        margin-bottom: 8px;
+      }
+      .title {
+        flex: 1;
+        font-weight: 600;
+        font-size: 13px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .close {
+        background: none;
+        border: none;
+        color: #9ca3af;
+        cursor: pointer;
+        font-size: 14px;
+        padding: 2px 4px;
+        line-height: 1;
+        border-radius: 4px;
+      }
+      .close:hover { color: #f3f4f6; background: rgba(255, 255, 255, 0.08); }
+      .field {
+        width: 100%;
+        box-sizing: border-box;
+        background: #12141a;
+        color: #f3f4f6;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 7px;
+        padding: 6px 8px;
+        font: inherit;
+        font-size: 12px;
+        margin-bottom: 9px;
+        outline: none;
+      }
+      .field:focus { border-color: #3b82f6; }
+      .actions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 6px;
+      }
+      button.btn {
+        font: inherit;
+        font-size: 12px;
+        font-weight: 500;
+        padding: 5px 11px;
+        border-radius: 7px;
+        cursor: pointer;
+        border: 1px solid transparent;
+      }
+      button.primary {
+        background: #2563eb;
+        color: #ffffff;
+      }
+      button.primary:hover:not(:disabled) { background: #1d4ed8; }
+      button.primary:disabled { opacity: 0.65; cursor: default; }
+      button.ghost {
+        background: transparent;
+        color: #9ca3af;
+        border-color: rgba(255, 255, 255, 0.12);
+      }
+      button.ghost:hover:not(:disabled) { color: #f3f4f6; background: rgba(255, 255, 255, 0.06); }
+      .hint {
+        font-size: 11px;
+        color: #f87171;
+        margin-top: 7px;
+      }
+      .hint.info {
+        color: #93c5fd;
+      }
+      .ok {
+        font-size: 12px;
+        color: #34d399;
+        font-weight: 500;
+        padding: 3px 0;
+      }
+      @media (prefers-color-scheme: light) {
+        .card {
+          background: #ffffff;
+          color: #111827;
+          border-color: rgba(0, 0, 0, 0.12);
+          box-shadow: 0 12px 32px rgba(0, 0, 0, 0.16);
+        }
+        .field {
+          background: #f9fafb;
+          color: #111827;
+          border-color: rgba(0, 0, 0, 0.15);
+        }
+        .close:hover { color: #111827; background: rgba(0, 0, 0, 0.06); }
+        button.ghost { color: #4b5563; border-color: rgba(0, 0, 0, 0.14); }
+        button.ghost:hover:not(:disabled) { color: #111827; background: rgba(0, 0, 0, 0.05); }
+      }
+    `;
+    saveShadow.appendChild(style);
+
+    const card = document.createElement("div");
+    card.className = "card";
+
+    const head = document.createElement("div");
+    head.className = "head";
+
+    const icon = document.createElement("span");
+    icon.textContent = "🔑";
+
+    const title = document.createElement("div");
+    title.className = "title";
+    title.textContent = `Save login · ${host}`;
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "close";
+    closeBtn.type = "button";
+    closeBtn.textContent = "✕";
+    closeBtn.title = "Dismiss";
+    closeBtn.addEventListener("click", (e) => {
+      if (!e.isTrusted) return;
+      dismissSaveBar(false);
+    });
+
+    head.append(icon, title, closeBtn);
+
+    const userField = document.createElement("input");
+    userField.className = "field";
+    userField.type = "text";
+    userField.placeholder = "Username (optional)";
+    userField.value = username || "";
+    userField.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") dismissSaveBar(false);
+      if (e.isTrusted && e.key === "Enter") performSave();
+    });
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+
+    const neverBtn = document.createElement("button");
+    neverBtn.className = "btn ghost";
+    neverBtn.type = "button";
+    neverBtn.textContent = "Never";
+    neverBtn.title = "Never offer to save on this site";
+    neverBtn.addEventListener("click", (e) => {
+      if (!e.isTrusted) return;
+      dismissSaveBar(true);
+    });
+
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "btn primary";
+    saveBtn.type = "button";
+    saveBtn.textContent = "Save";
+
+    const hintEl = document.createElement("div");
+    hintEl.className = "hint";
+    hintEl.hidden = true;
+
+    const resetAutoClose = () => {
+      clearTimeout(saveAutoCloseTimer);
+      saveAutoCloseTimer = setTimeout(hideSaveBar, 30_000);
+    };
+    card.addEventListener("pointerdown", resetAutoClose);
+    userField.addEventListener("input", resetAutoClose);
+    resetAutoClose();
+
+    let saving = false;
+    async function performSave(extra = {}) {
+      if (saving) return;
+      saving = true;
+      clearTimeout(saveAutoCloseTimer);
+      hintEl.hidden = true;
+      hintEl.className = "hint";
+      for (const b of actions.querySelectorAll("button")) b.disabled = true;
+      saveBtn.textContent = "Bitwarden…";
+
+      const slowHintTimer = setTimeout(() => {
+        if (saving) {
+          hintEl.className = "hint info";
+          hintEl.textContent = "Approve or unlock in Bitwarden Desktop…";
+          hintEl.hidden = false;
+        }
+      }, 700);
+
+      const res = await chrome.runtime
+        .sendMessage({
+          type: "content-confirm-save",
+          captureId,
+          username: userField.value,
+          ...extra,
+        })
+        .catch((err) => ({ ok: false, error: String(err) }));
+
+      clearTimeout(slowHintTimer);
+
+      if (!res?.ok) {
+        saving = false;
+        for (const b of actions.querySelectorAll("button")) b.disabled = false;
+        saveBtn.textContent = extra.updateCredentialId ? "Update" : "Save";
+        hintEl.className = "hint";
+        hintEl.textContent = formatSaveError(res?.error);
+        hintEl.hidden = false;
+        resetAutoClose();
+        return;
+      }
+
+      if (res.status === "confirm_update" && res.candidate?.credentialId) {
+        saving = false;
+        title.textContent = `Update "${res.candidate.name}"?`;
+        userField.disabled = true;
+        actions.replaceChildren();
+
+        const newBtn = document.createElement("button");
+        newBtn.className = "btn ghost";
+        newBtn.type = "button";
+        newBtn.textContent = "Save new";
+        newBtn.addEventListener("click", (ev) => {
+          if (!ev.isTrusted) return;
+          performSave({ forceCreate: true });
+        });
+
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Update";
+        const updateClone = saveBtn.cloneNode(true);
+        updateClone.addEventListener("click", (ev) => {
+          if (!ev.isTrusted) return;
+          performSave({ updateCredentialId: res.candidate.credentialId });
+        });
+
+        actions.append(newBtn, updateClone);
+        resetAutoClose();
+        return;
+      }
+
+      card.replaceChildren();
+      const okDiv = document.createElement("div");
+      okDiv.className = "ok";
+      okDiv.textContent =
+        res.status === "updated"
+          ? "✓ Password updated in Bitwarden"
+          : res.status === "unchanged"
+            ? "✓ Login already up to date"
+            : "✓ Saved to Bitwarden";
+      card.appendChild(okDiv);
+      setTimeout(hideSaveBar, 1200);
+    }
+
+    saveBtn.addEventListener("click", (e) => {
+      if (!e.isTrusted) return;
+      performSave();
+    });
+
+    actions.append(neverBtn, saveBtn);
+    card.append(head, userField, actions, hintEl);
+    saveShadow.appendChild(card);
+    document.documentElement.appendChild(saveHostEl);
+  }
+
+  if (window === window.top) {
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (msg?.type === "warden-show-save-bar") {
+        if (msg.spaFallback && hasActiveEditedPasswordOnPage()) {
+          setTimeout(() => {
+            if (!hasActiveEditedPasswordOnPage()) {
+              renderSaveBar(msg);
+            }
+          }, 2000);
+          return;
+        }
+        renderSaveBar(msg);
+      }
+    });
+
+    chrome.runtime
+      .sendMessage({ type: "content-check-pending-save" })
+      .then((res) => {
+        if (res?.ok && res.pending) {
+          renderSaveBar(res.pending);
+        }
+      })
+      .catch(() => {});
+  }
 
   window.addEventListener("scroll", positionOverlay, true);
   window.addEventListener("resize", positionOverlay, true);

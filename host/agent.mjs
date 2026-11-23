@@ -8,18 +8,22 @@ import {
   IS_WIN,
   SESSION_DIR,
   SOCKET_PATH,
+  focusOrLaunchBitwardenDesktop,
   getOrCreateAppId,
+  getStoredDesktopSharedKey,
   resolveDesktopProxyPath,
+  setStoredDesktopSharedKey,
 } from "./paths.mjs";
 import {
   decryptSymString,
   encryptSymEncString,
   queryLocalVaultForUrl,
   readAccountsFromLocalStore,
+  resolveBitwardenDataFile,
 } from "./vault.mjs";
 
 const DESKTOP_PROXY = resolveDesktopProxyPath();
-const HOST_VERSION = "0.3.0";
+const HOST_VERSION = "0.4.0";
 const PENDING_UNLOCK_MS = 60_000; // 60s window to pick an item after metadata-only unlock
 const HEARTBEAT_MS = 10_000;
 const SLEEP_GAP_MS = 30_000;
@@ -113,6 +117,7 @@ class DesktopBiometricBridge {
   proc = null;
   connectedPromise = null;
   bioListeners = new Set();
+  ddgQueue = Promise.resolve();
 
   ensureConnected() {
     if (this.connectedPromise) return this.connectedPromise;
@@ -331,6 +336,288 @@ class DesktopBiometricBridge {
 
     return unlockInFlight;
   }
+
+  async ensureConnectedLaunchingDesktop() {
+    try {
+      return await this.ensureConnected();
+    } catch {
+      focusOrLaunchBitwardenDesktop();
+      const deadline = Date.now() + Number(process.env.BW_LAUNCH_WAIT_MS || 15_000);
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500));
+        try {
+          return await this.ensureConnected();
+        } catch {}
+      }
+      throw new Error("desktop_not_connected");
+    }
+  }
+
+  async sendVersionedMessage(body, timeoutMs = 12_000) {
+    const proc = await this.ensureConnectedLaunchingDesktop();
+    const messageId = crypto.randomUUID();
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("desktop_ipc_timeout"));
+      }, timeoutMs);
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.bioListeners.delete(onMsg);
+      };
+
+      const onMsg = (msg) => {
+        if (msg?.__transportClosed) {
+          cleanup();
+          reject(new Error("desktop_disconnected"));
+          return;
+        }
+        if (msg?.version === 1 && msg.messageId === messageId) {
+          cleanup();
+          resolve(msg);
+        }
+      };
+
+      this.bioListeners.add(onMsg);
+      writeFrame(proc.stdin, { ...body, version: 1, messageId });
+    });
+  }
+
+  async ensureDesktopSharedKey(forceHandshake = false) {
+    if (!forceHandshake) {
+      const cachedB64 = getStoredDesktopSharedKey();
+      if (cachedB64) {
+        return Buffer.from(cachedB64, "base64");
+      }
+    }
+
+    const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const publicKeyB64 = publicKey.export({ type: "spki", format: "der" }).toString("base64");
+
+    const reply = await this.sendVersionedMessage(
+      {
+        command: "bw-handshake",
+        payload: {
+          publicKey: publicKeyB64,
+          applicationName: "Warden Air",
+        },
+      },
+      45_000,
+    );
+
+    if (reply?.payload?.error === "canceled") {
+      const dataFile = resolveBitwardenDataFile();
+      if (dataFile) {
+        try {
+          const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+          if (store.global_autofillSettings_enableDuckDuckGoBrowserIntegration !== true) {
+            throw new Error("ddg_integration_disabled");
+          }
+        } catch (e) {
+          if (e instanceof Error && e.message === "ddg_integration_disabled") throw e;
+        }
+      }
+      throw new Error("pairing_canceled");
+    }
+
+    if (!reply?.payload?.sharedKey) {
+      throw new Error(reply?.payload?.error || "handshake_failed");
+    }
+
+    const sharedKeyBuf = crypto.privateDecrypt(
+      {
+        key: privateKey,
+        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+        oaepHash: "sha1",
+      },
+      Buffer.from(reply.payload.sharedKey, "base64"),
+    );
+    setStoredDesktopSharedKey(sharedKeyBuf.toString("base64"));
+    return sharedKeyBuf;
+  }
+
+  async sendDesktopCommand(command, payload, timeoutMs = 12_000) {
+    for (const forceHandshake of [false, true]) {
+      const sharedKey = await this.ensureDesktopSharedKey(forceHandshake);
+      try {
+        const plainCmd = JSON.stringify(payload !== undefined ? { command, payload } : { command });
+        const encryptedCommand = encryptSymEncString(plainCmd, sharedKey).encryptedString;
+        const reply = await this.sendVersionedMessage({ encryptedCommand }, timeoutMs);
+
+        if (reply?.payload?.error === "cannot-decrypt" && !forceHandshake) {
+          setStoredDesktopSharedKey(null);
+          continue;
+        }
+        if (!reply?.encryptedPayload) {
+          throw new Error(reply?.payload?.error || "desktop_ipc_error");
+        }
+        const inner = JSON.parse(decryptSymString(reply.encryptedPayload, sharedKey));
+        return inner?.payload;
+      } finally {
+        sharedKey.fill(0);
+      }
+    }
+    throw new Error("desktop_cannot_decrypt");
+  }
+
+  saveLoginViaDesktop(params) {
+    const run = this.ddgQueue.then(() => this.#saveLoginViaDesktopImpl(params));
+    this.ddgQueue = run.catch(() => {});
+    return run;
+  }
+
+  async #saveLoginViaDesktopImpl({
+    uri,
+    username = "",
+    password = "",
+    updateCredentialId = null,
+    forceCreate = false,
+  }) {
+    let targetUrl;
+    try {
+      targetUrl = new URL(uri);
+    } catch {
+      throw new Error("invalid_uri");
+    }
+    if (!/^https?:$/i.test(targetUrl.protocol) || !password) {
+      throw new Error("invalid_credentials");
+    }
+
+    let accounts = await this.sendDesktopCommand("bw-status");
+    let active = Array.isArray(accounts) ? accounts.find((a) => a.active) || accounts[0] : null;
+    if (!active) {
+      throw new Error("no_account");
+    }
+
+    if (active.status !== "unlocked") {
+      focusOrLaunchBitwardenDesktop();
+      const unlockDeadline = Date.now() + Number(process.env.BW_UNLOCK_WAIT_MS || 45_000);
+      while (Date.now() < unlockDeadline) {
+        await new Promise((r) => setTimeout(r, 450));
+        accounts = await this.sendDesktopCommand("bw-status");
+        active = Array.isArray(accounts) ? accounts.find((a) => a.active) || accounts[0] : null;
+        if (!active) throw new Error("no_account");
+        if (active.status === "unlocked") break;
+      }
+      if (active.status !== "unlocked") {
+        throw new Error("desktop_locked");
+      }
+    }
+
+    const canonicalUri = `${targetUrl.origin}${targetUrl.pathname || "/"}`;
+    const existing = await this.sendDesktopCommand("bw-credential-retrieval", {
+      uri: targetUrl.href,
+    });
+    if (existing?.error) {
+      throw new Error(`desktop_${existing.error}`);
+    }
+    const list = Array.isArray(existing) ? existing : [];
+
+    const exactDup = list.find(
+      (c) => (c.userName ?? "") === username && (c.password ?? "") === password,
+    );
+    if (exactDup) {
+      return { status: "unchanged", credentialId: exactDup.credentialId, email: active.email };
+    }
+
+    const { ciphersMap, defaultMatch } = readLocalCipherMeta(active.id);
+
+    if (updateCredentialId) {
+      const chosen = list.find(
+        (c) =>
+          c.credentialId === updateCredentialId &&
+          isSafeDesktopUpdateTarget(c, ciphersMap, defaultMatch),
+      );
+      if (!chosen) {
+        throw new Error("update_target_unavailable");
+      }
+      const res = await this.sendDesktopCommand(
+        "bw-credential-update",
+        {
+          userId: active.id,
+          credentialId: chosen.credentialId,
+          name: chosen.name || targetUrl.host,
+          userName: username,
+          password,
+          uri: `${targetUrl.origin}/`,
+        },
+        30_000,
+      );
+      if (res?.status !== "success") {
+        throw new Error(res?.error || "desktop_update_failed");
+      }
+      return {
+        status: "updated",
+        credentialId: chosen.credentialId,
+        email: active.email,
+      };
+    }
+
+    if (!forceCreate && username) {
+      const candidate = list.find(
+        (c) =>
+          (c.userName ?? "") === username &&
+          isSafeDesktopUpdateTarget(c, ciphersMap, defaultMatch),
+      );
+      if (candidate) {
+        return {
+          status: "confirm_update",
+          candidate: {
+            credentialId: candidate.credentialId,
+            name: candidate.name || "(Untitled)",
+            userName: candidate.userName ?? "",
+          },
+          email: active.email,
+        };
+      }
+    }
+
+    const res = await this.sendDesktopCommand(
+      "bw-credential-create",
+      {
+        userId: active.id,
+        name: targetUrl.host,
+        userName: username,
+        password,
+        uri: canonicalUri,
+      },
+      30_000,
+    );
+    if (res?.status !== "success") {
+      throw new Error(res?.error || "desktop_create_failed");
+    }
+    return { status: "created", email: active.email };
+  }
+}
+
+function readLocalCipherMeta(userId) {
+  const dataFile = resolveBitwardenDataFile();
+  if (!dataFile) return { ciphersMap: {}, defaultMatch: 0 };
+  try {
+    const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+    return {
+      ciphersMap: store[`user_${userId}_ciphers_ciphers`] || {},
+      defaultMatch: store[`user_${userId}_domainSettings_defaultUriMatchStrategy`] ?? 0,
+    };
+  } catch {
+    return { ciphersMap: {}, defaultMatch: 0 };
+  }
+}
+
+function isSafeDesktopUpdateTarget(cipher, ciphersMap, defaultMatch) {
+  const raw = ciphersMap[cipher?.credentialId];
+  if (!raw) return false;
+  if (raw.deletedDate != null || raw.edit === false || raw.reprompt) return false;
+  const uris = raw.login?.uris;
+  if (Array.isArray(uris)) {
+    if (uris.length > 1) return false;
+    if (uris.length === 1) {
+      const effMatch = uris[0]?.match ?? defaultMatch;
+      if (effMatch !== 0 && effMatch !== 1) return false;
+    }
+  }
+  return true;
 }
 
 const bridge = new DesktopBiometricBridge();
@@ -410,6 +697,17 @@ async function handleAction(req) {
         return { id, ok: true, email: active.email, items };
       }
 
+      case "saveLogin": {
+        const result = await bridge.saveLoginViaDesktop({
+          uri: req.uri,
+          username: req.username || "",
+          password: req.password || "",
+          updateCredentialId: req.updateCredentialId || null,
+          forceCreate: Boolean(req.forceCreate),
+        });
+        return { id, ok: true, ...result };
+      }
+
       default:
         return { id, ok: false, error: "unknown_action" };
     }
@@ -436,12 +734,22 @@ fs.mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
 
 let ownsSocket = false;
 
+const IMMEDIATE_ACTIONS = new Set(["ping", "status", "lock", "shutdown"]);
+
 function createAgentServer() {
   const srv = net.createServer((socket) => {
     let queue = Promise.resolve();
     attachFrameReader(
       socket,
       (req) => {
+        if (IMMEDIATE_ACTIONS.has(req?.action)) {
+          handleAction(req)
+            .then((reply) => {
+              if (!socket.destroyed) writeFrame(socket, reply);
+            })
+            .catch(() => {});
+          return;
+        }
         queue = queue
           .then(async () => {
             const reply = await handleAction(req);

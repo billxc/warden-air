@@ -21,6 +21,7 @@ test("end-to-end host, single-instance agent, biometric unlock, and vault matchi
   const userId = "11111111-2222-3333-4444-555555555555";
   const userKey = crypto.randomBytes(64);
   const enc = (s) => encryptSymEncString(s, userKey).encryptedString;
+  const desktopStateFile = path.join(tmpRoot, "desktop-unlocked.flag");
 
   const dataFile = path.join(tmpRoot, "data.json");
   fs.writeFileSync(
@@ -30,6 +31,7 @@ test("end-to-end host, single-instance agent, biometric unlock, and vault matchi
         [userId]: { email: "test@example.com", name: "Tester" },
       },
       global_account_activeAccountId: userId,
+      global_autofillSettings_enableDuckDuckGoBrowserIntegration: true,
       [`user_${userId}_ciphers_ciphers`]: {
         "c-portal": {
           id: "c-portal",
@@ -109,8 +111,31 @@ test("end-to-end host, single-instance agent, biometric unlock, and vault matchi
             uris: [{ uri: enc("http://100.64.0.10:9000"), match: null }],
           },
         },
+        "c-readonly-org": {
+          id: "c-readonly-org",
+          type: 1,
+          deletedDate: null,
+          reprompt: 0,
+          edit: false,
+          name: enc("corp.example.net"),
+          login: {
+            username: enc("ops"),
+            password: enc("oldOrgPass"),
+            totp: null,
+            uris: [{ uri: enc("https://corp.example.net/"), match: null }],
+          },
+        },
       },
     }),
+  );
+
+  const mockFocus = path.join(tmpRoot, IS_WIN ? "mock-focus.cmd" : "mock-focus.sh");
+  fs.writeFileSync(
+    mockFocus,
+    IS_WIN
+      ? `@echo off\r\necho 1 > "${desktopStateFile}"\r\n`
+      : `#!/bin/sh\necho 1 > ${JSON.stringify(desktopStateFile)}\n`,
+    { mode: 0o755 },
   );
 
   const mockProxy = path.join(tmpRoot, "mock-proxy.mjs");
@@ -118,8 +143,16 @@ test("end-to-end host, single-instance agent, biometric unlock, and vault matchi
     mockProxy,
     `#!${process.execPath}
 import crypto from "node:crypto";
-import { encryptSymEncString, decryptSymString } from ${JSON.stringify(VAULT_MODULE_URL)};
-const USER_KEY_B64 = ${JSON.stringify(userKey.toString("base64"))};
+import fs from "node:fs";
+import { encryptSymEncString, decryptSymString, queryLocalVaultForUrl } from ${JSON.stringify(VAULT_MODULE_URL)};
+const USER_ID = ${JSON.stringify(userId)};
+const USER_KEY = Buffer.from(${JSON.stringify(userKey.toString("base64"))}, "base64");
+const USER_KEY_B64 = USER_KEY.toString("base64");
+const DATA_FILE = ${JSON.stringify(dataFile)};
+const UNLOCK_FLAG = ${JSON.stringify(desktopStateFile)};
+let ddgSharedSecret = null;
+let createdSeq = 0;
+
 function send(obj) {
   const b = Buffer.from(JSON.stringify(obj));
   const h = Buffer.alloc(4);
@@ -136,6 +169,89 @@ process.stdin.on("data", (c) => {
     if (buf.length < 4 + len) break;
     const msg = JSON.parse(buf.subarray(4, 4 + len).toString("utf8"));
     buf = buf.subarray(4 + len);
+
+    if (msg.version === 1) {
+      if (msg.command === "bw-handshake") {
+        const pubKey = crypto.createPublicKey({
+          key: Buffer.from(msg.payload.publicKey, "base64"),
+          format: "der",
+          type: "spki",
+        });
+        ddgSharedSecret = crypto.randomBytes(64);
+        const encSec = crypto.publicEncrypt(
+          { key: pubKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: "sha1" },
+          ddgSharedSecret,
+        );
+        send({
+          version: 1,
+          messageId: msg.messageId,
+          payload: { status: "success", sharedKey: encSec.toString("base64") },
+        });
+        continue;
+      }
+      if (!ddgSharedSecret || typeof msg.encryptedCommand !== "string") {
+        send({ version: 1, messageId: msg.messageId, payload: { error: "cannot-decrypt" } });
+        continue;
+      }
+      const inner = JSON.parse(decryptSymString(msg.encryptedCommand, ddgSharedSecret));
+      const isUnlocked = fs.existsSync(UNLOCK_FLAG);
+      let payload = {};
+      if (inner.command === "bw-status") {
+        payload = [
+          { id: USER_ID, email: "test@example.com", status: isUnlocked ? "unlocked" : "locked", active: true },
+        ];
+      } else if (!isUnlocked) {
+        payload = { error: "locked" };
+      } else if (inner.command === "bw-credential-retrieval") {
+        payload = queryLocalVaultForUrl(USER_ID, USER_KEY, inner.payload.uri).map((it) => ({
+          userId: USER_ID,
+          credentialId: it.credentialId,
+          name: it.name,
+          userName: it.userName,
+          password: it.password,
+        }));
+      } else if (inner.command === "bw-credential-create") {
+        const store = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+        const id = "c-created-" + (++createdSeq);
+        const e = (s) => encryptSymEncString(s, USER_KEY).encryptedString;
+        store[\`user_\${USER_ID}_ciphers_ciphers\`][id] = {
+          id,
+          type: 1,
+          deletedDate: null,
+          reprompt: 0,
+          name: e(inner.payload.name),
+          login: {
+            username: inner.payload.userName ? e(inner.payload.userName) : null,
+            password: e(inner.payload.password),
+            totp: null,
+            uris: [{ uri: e(inner.payload.uri), match: null }],
+          },
+        };
+        fs.writeFileSync(DATA_FILE, JSON.stringify(store));
+        payload = { status: "success" };
+      } else if (inner.command === "bw-credential-update") {
+        const store = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+        const target = store[\`user_\${USER_ID}_ciphers_ciphers\`][inner.payload.credentialId];
+        if (!target) {
+          payload = { status: "failure" };
+        } else {
+          const e = (s) => encryptSymEncString(s, USER_KEY).encryptedString;
+          target.name = e(inner.payload.name);
+          target.login.username = inner.payload.userName ? e(inner.payload.userName) : null;
+          target.login.password = e(inner.payload.password);
+          target.login.uris[0].uri = e(inner.payload.uri);
+          fs.writeFileSync(DATA_FILE, JSON.stringify(store));
+          payload = { status: "success" };
+        }
+      }
+      send({
+        version: 1,
+        messageId: msg.messageId,
+        encryptedPayload: encryptSymEncString(JSON.stringify({ command: inner.command, payload }), ddgSharedSecret).encryptedString,
+      });
+      continue;
+    }
+
     const { appId, message } = msg;
     if (message?.command === "setupEncryption") {
       const pubKey = crypto.createPublicKey({
@@ -186,6 +302,7 @@ process.stdin.on("data", (c) => {
     LOCALAPPDATA: fakeHome,
     BW_DATA_FILE: dataFile,
     BW_DESKTOP_PROXY: mockProxy,
+    BW_FOCUS_CMD: mockFocus,
   };
 
   function callHost(reqObj) {
@@ -333,4 +450,109 @@ process.stdin.on("data", (c) => {
   const afterLock = await callHost({ id: 15, action: "getLogins", uri: "https://example.com/" });
   assert.equal(afterLock.ok, false);
   assert.equal(afterLock.error, "locked");
+
+  // 7. Password save via Bitwarden Desktop IPC: concurrent cold handshake + foreground unlock wait + strict update rules
+  assert.equal(fs.existsSync(desktopStateFile), false);
+  const [createRes, roCreateRes] = await Promise.all([
+    callHost({
+      id: 20,
+      action: "saveLogin",
+      uri: "https://newsite.example.org/signup",
+      username: "charlie",
+      password: "initPass!9",
+    }),
+    // Read-only org cipher ("edit: false") must be skipped rather than offered for update
+    callHost({
+      id: 201,
+      action: "saveLogin",
+      uri: "https://corp.example.net/password",
+      username: "ops",
+      password: "personalOverride!1",
+    }),
+  ]);
+  assert.equal(createRes.ok, true);
+  assert.equal(createRes.status, "created");
+  assert.equal(roCreateRes.ok, true);
+  assert.equal(roCreateRes.status, "created");
+  assert.equal(fs.existsSync(desktopStateFile), true);
+
+  const createdFill = await callHost({
+    id: 22,
+    action: "unlock",
+    uri: "https://newsite.example.org/login",
+  });
+  assert.equal(createdFill.ok, true);
+  assert.equal(createdFill.items.length, 1);
+  assert.equal(createdFill.items[0].userName, "charlie");
+  assert.equal(createdFill.items[0].password, "initPass!9");
+
+  // Exact duplicate is a no-op
+  const dupRes = await callHost({
+    id: 23,
+    action: "saveLogin",
+    uri: "https://newsite.example.org/login",
+    username: "charlie",
+    password: "initPass!9",
+  });
+  assert.equal(dupRes.ok, true);
+  assert.equal(dupRes.status, "unchanged");
+
+  // Case-different username ("CHARLIE") creates a distinct login instead of overwriting "charlie"
+  const caseRes = await callHost({
+    id: 231,
+    action: "saveLogin",
+    uri: "https://newsite.example.org/login",
+    username: "CHARLIE",
+    password: "upperPass!1",
+  });
+  assert.equal(caseRes.ok, true);
+  assert.equal(caseRes.status, "created");
+
+  // Existing same-username match returns confirm_update with the item's display name instead of silently overwriting
+  const promptRes = await callHost({
+    id: 232,
+    action: "saveLogin",
+    uri: "https://shop.example.com/register",
+    username: "alice",
+    password: "shopOnlyPass!2",
+  });
+  assert.equal(promptRes.ok, true);
+  assert.equal(promptRes.status, "confirm_update");
+  assert.equal(promptRes.candidate.credentialId, "c-portal");
+  assert.equal(promptRes.candidate.name, "Example Portal");
+
+  // User choosing "Save new" (forceCreate) creates a separate login without touching "c-portal"
+  const forceCreateRes = await callHost({
+    id: 233,
+    action: "saveLogin",
+    uri: "https://shop.example.com/register",
+    username: "alice",
+    password: "shopOnlyPass!2",
+    forceCreate: true,
+  });
+  assert.equal(forceCreateRes.ok, true);
+  assert.equal(forceCreateRes.status, "created");
+
+  // User choosing explicit "Update" (updateCredentialId) updates that exact item and preserves TOTP
+  const updateRes = await callHost({
+    id: 24,
+    action: "saveLogin",
+    uri: "https://example.com/account/password",
+    username: "alice",
+    password: "rotated!2026",
+    updateCredentialId: "c-portal",
+  });
+  assert.equal(updateRes.ok, true);
+  assert.equal(updateRes.status, "updated");
+  assert.equal(updateRes.credentialId, "c-portal");
+
+  const updatedFill = await callHost({
+    id: 25,
+    action: "unlock",
+    uri: "https://example.com/login",
+  });
+  assert.equal(updatedFill.ok, true);
+  const updatedPortal = updatedFill.items.find((i) => i.credentialId === "c-portal");
+  assert.equal(updatedPortal?.password, "rotated!2026");
+  assert.match(updatedPortal?.totp, /^\d{6}$/);
 });

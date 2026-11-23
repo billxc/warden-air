@@ -12,6 +12,7 @@ Zero-login, zero-pairing Chromium autofill extension with in-place biometric unl
 1. Install standard (non-App-Store) **Bitwarden Desktop**, log in, and in **Settings** enable:
    - **Unlock with Touch ID / Windows Hello**
    - **Allow browser integration**
+   - **Allow DuckDuckGo browser integration** *(required for saving new/updated logins; on Windows where this toggle is hidden in UI, set `"global_autofillSettings_enableDuckDuckGoBrowserIntegration": true` in `%APPDATA%\Bitwarden\data.json` while Bitwarden Desktop is quit)*
 2. Install the Native Messaging Host directly from GitHub (requires Node.js; no local repo clone needed):
    - **macOS (Terminal)**:
      ```sh

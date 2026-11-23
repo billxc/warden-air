@@ -51,4 +51,11 @@ foreach ($RegKey in $RegistryTargets) {
   Write-Host "Registered: $RegKey -> $ManifestPath"
 }
 
+$BwData = Join-Path $env:APPDATA "Bitwarden\data.json"
+if (Test-Path $BwData) {
+  if (-not (Select-String -Path $BwData -Pattern '"global_autofillSettings_enableDuckDuckGoBrowserIntegration":\s*true' -Quiet)) {
+    Write-Host "Tip: To enable password saving on Windows, quit Bitwarden Desktop and set `"global_autofillSettings_enableDuckDuckGoBrowserIntegration`": true in $BwData."
+  }
+}
+
 Write-Host "Done."

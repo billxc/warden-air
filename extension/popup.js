@@ -1,4 +1,4 @@
-const MIN_HOST_VERSION = "0.3.0";
+const MIN_HOST_VERSION = "0.4.0";
 const IS_MAC = navigator.platform?.toUpperCase().includes("MAC");
 const BIO_LABEL = IS_MAC ? "Touch ID" : "Windows Hello";
 const SHELL_LABEL = IS_MAC ? "Terminal" : "PowerShell";

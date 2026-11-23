@@ -90,3 +90,10 @@ except Exception:
 fi
 
 print "Done. Registered $HOST_NAME in $installed_count browser(s)."
+
+BW_DATA="$HOME/Library/Application Support/Bitwarden/data.json"
+if [[ -f "$BW_DATA" ]]; then
+  if ! grep -q '"global_autofillSettings_enableDuckDuckGoBrowserIntegration":[[:space:]]*true' "$BW_DATA" 2>/dev/null; then
+    print "Tip: Enable 'Allow DuckDuckGo browser integration' in Bitwarden Desktop -> Settings to support password saving."
+  fi
+fi
