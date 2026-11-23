@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Warden Air",
+  "version": "0.3.0",
+  "description": "Zero-login browser autofill with in-place Touch ID unlock.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoA45U61R2REGNliK5yW6KbM+WiO5q92biFtJOzw+0wnqCsOFo9mQ96PsX8w1L7x2m5oIKyeP9Rs2kh5BGq4zP1ZuKG7/GHwWkdnNi+KbEhgUzSzMbKyLJ113rEh6YfgYclCRPFiDgxZcKl+/hh1uUrPqrJHFd9xTs+Otn2DWOrlyRY6FJFsTTNgm0cNNBpaFOt+TjQSEzhbcYgcbxKup+E315SWhCA8a/j+NgW9H8Gb8ity4dVIUimhDpDAFmroz1gE5xLas1KBNoq4Z3Blm5F8EQdexAVPPuxlBwZ4G2lnI5yGiA1CZYWBH6PK8ZpUOjHLEPeqODyD+M+0Oa6paGQIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "activeTab",
+    "scripting",
+    "clipboardWrite"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*/*", "http://*/*"],
+      "js": ["content.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Warden Air",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "commands": {
+    "fill-active-tab": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+L",
+        "mac": "Command+Shift+L"
+      },
+      "description": "Autofill current page (triggers Touch ID if locked)"
+    }
+  }
+}

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="12" y1="8" x2="116" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#132347" />
+      <stop offset="55%" stop-color="#0D1830" />
+      <stop offset="100%" stop-color="#091022" />
+    </linearGradient>
+    <linearGradient id="rim" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7DD3FC" stop-opacity="0.42" />
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0.08" />
+    </linearGradient>
+    <linearGradient id="keyFill" x1="22" y1="36" x2="108" y2="92" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="55%" stop-color="#E0F2FE" />
+      <stop offset="100%" stop-color="#38BDF8" />
+    </linearGradient>
+    <linearGradient id="airStreak" x1="64" y1="48" x2="102" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.15" />
+      <stop offset="100%" stop-color="#7DD3FC" stop-opacity="0.85" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded squircle tile -->
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bg)" />
+  <rect x="7" y="7" width="114" height="114" rx="27" fill="none" stroke="url(#rim)" stroke-width="2" />
+
+  <!-- Subtle elevation shadow under the key -->
+  <g transform="translate(0 3.5) rotate(-45 64 64)" fill="#030712" fill-opacity="0.45">
+    <path
+      fill-rule="evenodd"
+      d="M42 42a22 22 0 1 0 0 44a22 22 0 1 0 0-44ZM42 55a9 9 0 1 1 0 18a9 9 0 1 1 0-18Z"
+    />
+    <path d="M58 58h47l6 6l-6 6H58Z" />
+    <rect x="73" y="68" width="11" height="13" rx="3" />
+    <rect x="89" y="68" width="12" height="19" rx="3" />
+  </g>
+
+  <!-- Diagonal 45-degree key + Air slipstream accent -->
+  <g transform="rotate(-45 64 64)">
+    <rect x="65" y="48" width="33" height="4.5" rx="2.25" fill="url(#airStreak)" />
+    <path
+      fill="url(#keyFill)"
+      fill-rule="evenodd"
+      d="M42 42a22 22 0 1 0 0 44a22 22 0 1 0 0-44ZM42 55a9 9 0 1 1 0 18a9 9 0 1 1 0-18Z"
+    />
+    <path fill="url(#keyFill)" d="M58 58h47l6 6l-6 6H58Z" />
+    <rect x="73" y="68" width="11" height="13" rx="3" fill="url(#keyFill)" />
+    <rect x="89" y="68" width="12" height="19" rx="3" fill="url(#keyFill)" />
+  </g>
+</svg>

@@ -1,0 +1,6 @@
+.DS_Store
+.scratch/
+*.crx
+*.pem
+*.zip
+node_modules/

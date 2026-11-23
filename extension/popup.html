@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Warden Air</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --fg: #111827;
+        --muted: #6b7280;
+        --card: #f3f4f6;
+        --card-hover: #e5e7eb;
+        --border: #e5e7eb;
+        --accent: #175ddc;
+        --accent-fg: #ffffff;
+        --warn-bg: #fef3c7;
+        --warn-fg: #92400e;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #181a1f;
+          --fg: #f3f4f6;
+          --muted: #9ca3af;
+          --card: #23272f;
+          --card-hover: #2d323d;
+          --border: #303642;
+          --accent: #3b82f6;
+          --accent-fg: #ffffff;
+          --warn-bg: #3b2a14;
+          --warn-fg: #fcd34d;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        width: 340px;
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--border);
+      }
+      .brand {
+        font-weight: 600;
+        font-size: 14px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #9ca3af;
+      }
+      .dot.ok {
+        background: #22c55e;
+      }
+      .dot.locked {
+        background: #f59e0b;
+      }
+      .header-right {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .account-tag {
+        font-size: 11px;
+        color: var(--muted);
+        max-width: 150px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      main {
+        padding: 12px 14px;
+      }
+      .notice {
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: var(--warn-bg);
+        color: var(--warn-fg);
+        font-size: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .cmd-box {
+        margin: 0;
+        padding: 7px 8px;
+        border-radius: 6px;
+        background: var(--bg);
+        color: var(--fg);
+        border: 1px solid var(--border);
+        font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        white-space: pre-wrap;
+        word-break: break-all;
+        user-select: all;
+      }
+      .notice-actions {
+        display: flex;
+        gap: 6px;
+      }
+      .notice-actions .primary {
+        flex: 1;
+      }
+      .empty {
+        padding: 18px 8px;
+        text-align: center;
+        color: var(--muted);
+      }
+      .list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: var(--card);
+        cursor: pointer;
+        transition: background 0.12s ease;
+      }
+      .item:hover {
+        background: var(--card-hover);
+      }
+      .item-info {
+        min-width: 0;
+        flex: 1;
+      }
+      .item-name {
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .item-user {
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .actions {
+        display: flex;
+        gap: 4px;
+      }
+      button {
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--fg);
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: var(--accent);
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-fg);
+        font-weight: 500;
+        padding: 6px 10px;
+        font-size: 12px;
+      }
+      footer {
+        padding: 8px 14px;
+        border-top: 1px solid var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      kbd {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 10px;
+        padding: 1px 4px;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span id="status-dot" class="dot"></span>
+        <span>Warden Air</span>
+      </div>
+      <div class="header-right">
+        <div id="account-tag" class="account-tag">Connecting…</div>
+        <button id="lock-btn" type="button" hidden title="Lock in-memory session">Lock</button>
+      </div>
+    </header>
+    <main id="content">
+      <div class="empty">Loading…</div>
+    </main>
+    <footer>
+      <span>Quick fill: <kbd>⌘⇧L</kbd></span>
+      <button id="refresh-btn" type="button">Refresh</button>
+    </footer>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
