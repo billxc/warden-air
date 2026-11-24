@@ -1,10 +1,7 @@
 const MIN_HOST_VERSION = "0.4.0";
 const IS_MAC = navigator.platform?.toUpperCase().includes("MAC");
 const BIO_LABEL = IS_MAC ? "Touch ID" : "Windows Hello";
-const SHELL_LABEL = IS_MAC ? "Terminal" : "PowerShell";
-const INSTALL_CMD = IS_MAC
-  ? "curl -fsSL https://raw.githubusercontent.com/billxc/warden-air/main/scripts/install.sh | zsh"
-  : "irm https://raw.githubusercontent.com/billxc/warden-air/main/scripts/install.ps1 | iex";
+const SETUP_DOCS_URL = "https://github.com/billxc/warden-air#setup";
 
 const dotEl = document.getElementById("status-dot");
 const accountTagEl = document.getElementById("account-tag");
@@ -62,32 +59,28 @@ function renderInstallGuide(message) {
   const text = document.createElement("div");
   text.textContent = message;
 
-  const pre = document.createElement("pre");
-  pre.className = "cmd-box";
-  pre.textContent = INSTALL_CMD;
+  const disclaimer = document.createElement("div");
+  disclaimer.className = "notice-note";
+  disclaimer.textContent =
+    "This extension requires a separate open-source local native messaging host to communicate with Bitwarden Desktop. Please read the documentation and security model on GitHub before installing or running anything locally.";
 
   const actions = document.createElement("div");
   actions.className = "notice-actions";
 
-  const copyBtn = document.createElement("button");
-  copyBtn.className = "primary";
-  copyBtn.type = "button";
-  copyBtn.textContent = "Copy Install Command";
-  copyBtn.addEventListener("click", async () => {
-    await navigator.clipboard.writeText(INSTALL_CMD);
-    copyBtn.textContent = "Copied!";
-    setTimeout(() => {
-      copyBtn.textContent = "Copy Install Command";
-    }, 1200);
-  });
+  const docsLink = document.createElement("a");
+  docsLink.className = "primary";
+  docsLink.href = SETUP_DOCS_URL;
+  docsLink.target = "_blank";
+  docsLink.rel = "noopener noreferrer";
+  docsLink.textContent = "Read Setup Docs on GitHub";
 
   const retryBtn = document.createElement("button");
   retryBtn.type = "button";
   retryBtn.textContent = "Retry";
   retryBtn.addEventListener("click", load);
 
-  actions.append(copyBtn, retryBtn);
-  box.append(text, pre, actions);
+  actions.append(docsLink, retryBtn);
+  box.append(text, disclaimer, actions);
   contentEl.appendChild(box);
 }
 
@@ -213,9 +206,7 @@ async function load() {
     accountTagEl.textContent = "Disconnected";
     const err = statusRes?.error || "";
     if (err.includes("Specified native messaging host not found")) {
-      renderInstallGuide(
-        `Local host not installed. Run in ${SHELL_LABEL} to install directly from GitHub (Node.js required):`,
-      );
+      renderInstallGuide("Local native messaging host is not installed.");
       return;
     }
     renderNotice(`Host error: ${err || "unreachable"}`, "Retry", load);
@@ -225,7 +216,7 @@ async function load() {
   if (isVersionOlder(statusRes.hostVersion, MIN_HOST_VERSION)) {
     accountTagEl.textContent = `Host v${statusRes.hostVersion || "?"}`;
     renderInstallGuide(
-      `Local host (v${statusRes.hostVersion || "unknown"}) is older than required v${MIN_HOST_VERSION}. Run in ${SHELL_LABEL} to update from GitHub:`,
+      `Local host (v${statusRes.hostVersion || "unknown"}) is older than required v${MIN_HOST_VERSION}. Please update it following the GitHub documentation.`,
     );
     return;
   }

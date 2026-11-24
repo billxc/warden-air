@@ -23,7 +23,7 @@ Zero-login, zero-pairing Chromium autofill extension with in-place biometric unl
      irm https://raw.githubusercontent.com/billxc/warden-air/main/scripts/install.ps1 | iex
      ```
    *(For local repository development, run `./scripts/install.sh --local` or `.\scripts\install.ps1 -Local`.)*
-3. In any Chromium browser (`chrome://extensions` or `edge://extensions`), turn on **Developer mode** -> **Load unpacked** -> select the `extension/` folder (if you skip step 2, the extension popup also provides a one-click install command).
+3. In any Chromium browser (`chrome://extensions` or `edge://extensions`), turn on **Developer mode** -> **Load unpacked** -> select the `extension/` folder (if you skip step 2, the extension popup links back to these setup instructions).
 
 ## Usage & Security Model
 

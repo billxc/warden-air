@@ -2,7 +2,8 @@
 set -euo pipefail
 
 HOST_NAME="io.github.billxc.warden_air"
-EXTENSION_ID="nphekoiaefcbmdmoknadaohgnloneeaj"
+DEV_EXTENSION_ID="nphekoiaefcbmdmoknadaohgnloneeaj"
+STORE_EXTENSION_ID="jgbhlklgdnndgheichoiibbgnincpbad"
 RAW_BASE="${WARDEN_AIR_RAW_BASE:-https://raw.githubusercontent.com/billxc/warden-air/main}"
 INSTALL_DIR="$HOME/.config/warden-air/host"
 
@@ -63,7 +64,8 @@ for dir in "${BROWSER_DIRS[@]}"; do
   "path": "$HOST_BIN",
   "type": "stdio",
   "allowed_origins": [
-    "chrome-extension://$EXTENSION_ID/"
+    "chrome-extension://$DEV_EXTENSION_ID/",
+    "chrome-extension://$STORE_EXTENSION_ID/"
   ]
 }
 EOF

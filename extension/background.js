@@ -79,15 +79,15 @@ const pending = new Map();
 // tabId -> { captureId, uri, origin, host, hostname, frameId, senderWindowId, windowId, openingWindow, username, password, updatedAt, timer, retryTimer, expiryTimer }
 const pendingSaves = new Map();
 
+let claimedPasswordManager = false;
+
 function claimPasswordManager() {
+  if (claimedPasswordManager) return;
+  claimedPasswordManager = true;
   chrome.privacy?.services?.passwordSavingEnabled?.set({ value: false }, () => {
     void chrome.runtime.lastError;
   });
 }
-
-chrome.runtime.onInstalled.addListener(claimPasswordManager);
-chrome.runtime.onStartup.addListener(claimPasswordManager);
-claimPasswordManager();
 
 function clearPendingSave(tabId, { closeWindow = true } = {}) {
   const entry = pendingSaves.get(tabId);
@@ -195,6 +195,7 @@ function getPort() {
   port = chrome.runtime.connectNative(HOST_NAME);
 
   port.onMessage.addListener((msg) => {
+    claimPasswordManager();
     const entry = pending.get(msg?.id);
     if (entry) {
       pending.delete(msg.id);
@@ -206,7 +207,7 @@ function getPort() {
     const errMsg = chrome.runtime.lastError?.message || "host_disconnected";
     port = null;
     for (const [, entry] of pending) {
-      entry.resolve({ ok: false, error: errMsg });
+      entry.resolve({ ok: false, error: errMsg, transportError: true });
     }
     pending.clear();
   });
@@ -222,7 +223,11 @@ function callHost(action, params = {}) {
       getPort().postMessage({ id, action, ...params });
     } catch (err) {
       pending.delete(id);
-      resolve({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      resolve({
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+        transportError: true,
+      });
     }
   });
 }
@@ -487,7 +492,7 @@ async function handlePasskeyGetWithPopout(sender, requestId, rawData) {
     };
   }
 
-  if (!queryRes) {
+  if (!queryRes || queryRes.transportError) {
     return fallbackSupported
       ? { ok: false, fallbackRequested: true }
       : { ok: false, error: { name: "NotAllowedError", message: "Native host unavailable." } };

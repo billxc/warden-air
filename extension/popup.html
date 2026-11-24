@@ -93,17 +93,14 @@
         flex-direction: column;
         gap: 8px;
       }
-      .cmd-box {
-        margin: 0;
+      .notice-note {
         padding: 7px 8px;
         border-radius: 6px;
         background: var(--bg);
-        color: var(--fg);
+        color: var(--muted);
         border: 1px solid var(--border);
-        font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        white-space: pre-wrap;
-        word-break: break-all;
-        user-select: all;
+        font-size: 11px;
+        line-height: 1.45;
       }
       .notice-actions {
         display: flex;
@@ -169,13 +166,18 @@
       button:hover {
         border-color: var(--accent);
       }
-      button.primary {
+      button.primary,
+      a.primary {
         background: var(--accent);
-        border-color: var(--accent);
+        border: 1px solid var(--accent);
+        border-radius: 6px;
         color: var(--accent-fg);
         font-weight: 500;
         padding: 6px 10px;
         font-size: 12px;
+        text-decoration: none;
+        text-align: center;
+        cursor: pointer;
       }
       footer {
         padding: 8px 14px;

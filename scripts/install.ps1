@@ -5,7 +5,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $HostName = "io.github.billxc.warden_air"
-$ExtensionId = "nphekoiaefcbmdmoknadaohgnloneeaj"
+$DevExtensionId = "nphekoiaefcbmdmoknadaohgnloneeaj"
+$StoreExtensionId = "jgbhlklgdnndgheichoiibbgnincpbad"
 $RawBase = if ($env:WARDEN_AIR_RAW_BASE) { $env:WARDEN_AIR_RAW_BASE } else { "https://raw.githubusercontent.com/billxc/warden-air/main" }
 $AppDir = Join-Path $env:LOCALAPPDATA "warden-air"
 
@@ -33,7 +34,10 @@ $ManifestObj = [ordered]@{
   description = "Warden Air native messaging host"
   path = $HostCmd
   type = "stdio"
-  allowed_origins = @("chrome-extension://$ExtensionId/")
+  allowed_origins = @(
+    "chrome-extension://$DevExtensionId/",
+    "chrome-extension://$StoreExtensionId/"
+  )
 }
 $ManifestObj | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 -Path $ManifestPath
 
