@@ -722,6 +722,7 @@ export class VaultUriCache {
       password = "",
       editable = true,
       preserveExistingRules = false,
+      prevRevisionDate = null,
     },
   ) {
     if (!userId || !uri) return;
@@ -730,8 +731,10 @@ export class VaultUriCache {
 
     const dataFile = this.#resolveDataFile();
     let defaultMatch = state.defaultMatch;
+    let raw = null;
     let revisionDate = "";
     let liveRawMatch = null;
+    let hasSingleUri = false;
     let liveMtimeMs = -1;
     if (dataFile) {
       try {
@@ -739,9 +742,10 @@ export class VaultUriCache {
         const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
         defaultMatch = store[`user_${userId}_domainSettings_defaultUriMatchStrategy`] ?? 0;
         if (credentialId) {
-          const raw = store[`user_${userId}_ciphers_ciphers`]?.[credentialId];
+          raw = store[`user_${userId}_ciphers_ciphers`]?.[credentialId] || null;
           revisionDate = raw?.revisionDate || "";
           if (Array.isArray(raw?.login?.uris) && raw.login.uris.length === 1) {
+            hasSingleUri = true;
             liveRawMatch = raw.login.uris[0]?.match ?? null;
           }
         }
@@ -751,7 +755,13 @@ export class VaultUriCache {
 
     const prev = credentialId ? state.loginEntries.get(credentialId) : null;
     const reusePrevRules = Boolean(preserveExistingRules && prev?.rulesFresh);
-    const savedRule = preserveExistingRules ? { uri, match: 3 } : { uri, match: liveRawMatch };
+    const effMatch = liveRawMatch ?? defaultMatch;
+    const canInferEquivScope = hasSingleUri && (effMatch === 0 || effMatch === 1);
+    const savedRule = preserveExistingRules
+      ? canInferEquivScope
+        ? { uri, match: liveRawMatch }
+        : { uri, match: 3 }
+      : { uri, match: liveRawMatch };
 
     if (isAutofillEligibleUrl(uri) && !reusePrevRules) {
       state.savedRules.set(uri, savedRule);
@@ -761,6 +771,17 @@ export class VaultUriCache {
     }
     if (!password) return;
 
+    let awaitingDiskFlush = false;
+    if (!preserveExistingRules) {
+      if (!credentialId) {
+        awaitingDiskFlush = true;
+      } else if (prevRevisionDate === null) {
+        awaitingDiskFlush = !raw;
+      } else {
+        awaitingDiskFlush = !raw || revisionDate === prevRevisionDate;
+      }
+    }
+
     const userHmac = this.#hmac("u", username);
     const passHmac = this.#hmac("p", password);
     const rules = reusePrevRules ? prev.rules : [savedRule];
@@ -769,9 +790,11 @@ export class VaultUriCache {
     state.loginEntries.set(key, {
       credentialId,
       rules,
-      rulesFresh: !preserveExistingRules || reusePrevRules,
+      rulesFresh: !preserveExistingRules || reusePrevRules || canInferEquivScope,
       revisionDate,
       recordedMtimeMs: liveMtimeMs,
+      pendingDiskSyncUntil: awaitingDiskFlush ? Date.now() + 10_000 : 0,
+      awaitingCreate: Boolean(awaitingDiskFlush && credentialId && prevRevisionDate === null),
       editable: Boolean(editable && credentialId),
       name: name || prev?.name || "",
       userHmac,
@@ -808,22 +831,43 @@ export class VaultUriCache {
       const ciphersMap = store[`user_${userId}_ciphers_ciphers`] || {};
       const defaultMatch = store[`user_${userId}_domainSettings_defaultUriMatchStrategy`] ?? 0;
       const defaultChanged = defaultMatch !== state.defaultMatch;
+      const now = Date.now();
       state.defaultMatch = defaultMatch;
 
       for (const [key, item] of state.loginEntries.entries()) {
+        const pendingFlush = item.pendingDiskSyncUntil > now;
         if (!item.credentialId) {
           if (item.recordedMtimeMs !== mtimeMs) {
-            state.loginEntries.delete(key);
+            if (pendingFlush) {
+              item.recordedMtimeMs = mtimeMs;
+              item.pendingDiskSyncUntil = 0;
+            } else {
+              state.loginEntries.delete(key);
+            }
           }
           continue;
         }
         const raw = ciphersMap[item.credentialId];
+        if (!raw) {
+          if (!pendingFlush) {
+            state.loginEntries.delete(key);
+            state.cipherRules.delete(item.credentialId);
+          }
+          continue;
+        }
         if (!isEligiblePasswordCipher(raw)) {
           state.loginEntries.delete(key);
           state.cipherRules.delete(item.credentialId);
           continue;
         }
         const liveRev = raw.revisionDate || "";
+        if (pendingFlush && (item.awaitingCreate || liveRev !== item.revisionDate)) {
+          item.revisionDate = liveRev;
+          item.editable = isSafeUpdateCipherRaw(raw, defaultMatch);
+          item.pendingDiskSyncUntil = 0;
+          item.awaitingCreate = false;
+          continue;
+        }
         if (liveRev !== item.revisionDate) {
           if (state.cipherRules.has(item.credentialId)) {
             item.revisionDate = liveRev;

@@ -28,7 +28,6 @@ import {
   encryptSymEncString,
   hasAnyPasskeyInLocalStore,
   isAutofillEligibleUrl,
-  isEligiblePasswordCipher,
   isSafeUpdateCipherRaw,
   queryLocalVaultForUrl,
   readAccountsFromLocalStore,
@@ -481,7 +480,7 @@ class DesktopBiometricBridge {
     throw new Error("desktop_cannot_decrypt");
   }
 
-  async sendPassiveDesktopCommand(command, payload, timeoutMs = 800) {
+  async sendPassiveDesktopCommand(command, payload, timeoutMs = 1500) {
     const cachedB64 = getStoredDesktopSharedKey();
     if (!cachedB64) return null;
     const sharedKey = Buffer.from(cachedB64, "base64");
@@ -521,6 +520,19 @@ class DesktopBiometricBridge {
     if (!Array.isArray(existing)) return null;
 
     const { ciphersMap, defaultMatch } = readLocalCipherMeta(active.id);
+    for (const item of existing) {
+      if (!item?.credentialId || !item.password) continue;
+      vaultUriCache.recordSavedLogin(active.id, {
+        credentialId: item.credentialId,
+        name: item.name || targetUrl.host,
+        uri: targetUrl.href,
+        username: item.userName ?? "",
+        password: item.password,
+        editable: isSafeDesktopUpdateTarget(item, ciphersMap, defaultMatch),
+        preserveExistingRules: true,
+      });
+    }
+
     const { exactDup, candidate } = matchExistingDesktopCredential(
       existing,
       username,
@@ -650,6 +662,7 @@ class DesktopBiometricBridge {
       const updatedUri = `${targetUrl.origin}/`;
       const nextUserName = username || (chosen.userName ?? "");
       const itemName = chosen.name || targetUrl.host;
+      const prevRevisionDate = ciphersMap[chosen.credentialId]?.revisionDate ?? "";
       const res = await this.sendDesktopCommand(
         "bw-credential-update",
         {
@@ -672,6 +685,7 @@ class DesktopBiometricBridge {
         username: nextUserName,
         password,
         editable: true,
+        prevRevisionDate,
       });
       return {
         status: "updated",
@@ -681,7 +695,7 @@ class DesktopBiometricBridge {
       };
     }
 
-    const beforeCipherIds = new Set(Object.keys(ciphersMap));
+    const beforeIds = new Set(list.map((c) => c.credentialId));
     const res = await this.sendDesktopCommand(
       "bw-credential-create",
       {
@@ -696,11 +710,22 @@ class DesktopBiometricBridge {
     if (res?.status !== "success") {
       throw new Error(res?.error || "desktop_create_failed");
     }
-    const { ciphersMap: afterCiphersMap } = readLocalCipherMeta(active.id);
-    const addedIds = Object.keys(afterCiphersMap).filter(
-      (cid) => !beforeCipherIds.has(cid) && isEligiblePasswordCipher(afterCiphersMap[cid]),
-    );
-    const createdId = res?.credentialId || (addedIds.length === 1 ? addedIds[0] : null);
+    let createdId = res?.credentialId || null;
+    if (!createdId) {
+      const after = await this.sendDesktopCommand("bw-credential-retrieval", {
+        uri: targetUrl.href,
+      }).catch(() => null);
+      if (Array.isArray(after)) {
+        const added = after.find(
+          (c) =>
+            c?.credentialId &&
+            !beforeIds.has(c.credentialId) &&
+            (c.userName ?? "") === username &&
+            (c.password ?? "") === password,
+        );
+        createdId = added?.credentialId || null;
+      }
+    }
     vaultUriCache.recordSavedLogin(active.id, {
       credentialId: createdId,
       name: targetUrl.host,
@@ -708,6 +733,7 @@ class DesktopBiometricBridge {
       username,
       password,
       editable: Boolean(createdId),
+      prevRevisionDate: null,
     });
     return { status: "created", credentialId: createdId, email: active.email, focusedDesktop };
   }

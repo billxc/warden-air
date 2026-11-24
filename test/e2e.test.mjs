@@ -736,3 +736,101 @@ test("URL eligibility and VaultUriCache passwordless / public-HTTP filtering", (
   assert.equal(isPrivateOrLocalHost("10.attacker.com"), false);
   assert.equal(typeof VaultUriCache, "function");
 });
+
+test("VaultUriCache absorbs delayed Electron disk flush without evicting newly saved credentials", () => {
+  const tmpDir = fs.mkdtempSync(IS_WIN ? path.join(process.env.TEMP || ".", "wa-fc-") : "/tmp/wa-fc-");
+  try {
+    const userId = "u-1";
+    const dataFile = path.join(tmpDir, "data.json");
+    const writeStore = (ciphers, bumpSec) => {
+      fs.writeFileSync(
+        dataFile,
+        JSON.stringify({ [`user_${userId}_ciphers_ciphers`]: ciphers }),
+      );
+      const ts = Date.now() / 1000 + bumpSec;
+      fs.utimesSync(dataFile, ts, ts);
+    };
+
+    writeStore({}, 0);
+    const cache = new VaultUriCache({ dataFileResolver: () => dataFile });
+
+    // 1. Created via IPC before Electron flushes c-new to data.json
+    cache.recordSavedLogin(userId, {
+      credentialId: "c-new",
+      name: "app.example.com",
+      uri: "https://app.example.com/signup",
+      username: "alice",
+      password: "p1",
+      editable: true,
+      prevRevisionDate: null,
+    });
+
+    // Electron flushes c-new 200ms later -> cache absorbs R1 instead of deleting c-new
+    writeStore(
+      {
+        "c-new": {
+          id: "c-new",
+          type: 1,
+          deletedDate: null,
+          reprompt: 0,
+          revisionDate: "2026-11-24T10:00:00.000Z",
+          login: { password: "enc", uris: [{ uri: "enc", match: null }] },
+        },
+      },
+      10,
+    );
+    assert.equal(
+      cache.inspectSaveCandidate(userId, "https://app.example.com/login", "alice", "p1").decision,
+      "unchanged",
+    );
+
+    // 2. Updated via IPC while disk still holds R1 -> Electron flushes R2 later -> cache absorbs R2
+    cache.recordSavedLogin(userId, {
+      credentialId: "c-new",
+      name: "app.example.com",
+      uri: "https://app.example.com/",
+      username: "alice",
+      password: "p2",
+      editable: true,
+      prevRevisionDate: "2026-11-24T10:00:00.000Z",
+    });
+    writeStore(
+      {
+        "c-new": {
+          id: "c-new",
+          type: 1,
+          deletedDate: null,
+          reprompt: 0,
+          revisionDate: "2026-11-24T10:01:00.000Z",
+          login: { password: "enc", uris: [{ uri: "enc", match: null }] },
+        },
+      },
+      20,
+    );
+    assert.equal(
+      cache.inspectSaveCandidate(userId, "https://app.example.com/login", "alice", "p2").decision,
+      "unchanged",
+    );
+
+    // 3. A subsequent external Desktop edit (R3) properly invalidates the cached hash
+    writeStore(
+      {
+        "c-new": {
+          id: "c-new",
+          type: 1,
+          deletedDate: null,
+          reprompt: 0,
+          revisionDate: "2026-11-24T10:02:00.000Z",
+          login: { password: "enc", uris: [{ uri: "enc", match: null }] },
+        },
+      },
+      30,
+    );
+    assert.equal(
+      cache.inspectSaveCandidate(userId, "https://app.example.com/login", "alice", "p2").decision,
+      "unknown",
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
