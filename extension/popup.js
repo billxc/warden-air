@@ -289,104 +289,6 @@ async function load() {
   renderItems(tab.id, tab.url, loginsRes.items);
 }
 
-function parseOtpAuthMeta(uri) {
-  if (/^steam:\/\//i.test(uri)) {
-    return { issuer: "Steam", account: "" };
-  }
-  try {
-    const u = new URL(uri);
-    const rawLabel = decodeURIComponent(u.pathname.replace(/^\/+/, ""));
-    const colonIdx = rawLabel.indexOf(":");
-    const labelIssuer = colonIdx >= 0 ? rawLabel.slice(0, colonIdx).trim() : "";
-    const account = colonIdx >= 0 ? rawLabel.slice(colonIdx + 1).trim() : rawLabel.trim();
-    const issuer = (u.searchParams.get("issuer") || labelIssuer || "").trim();
-    return { issuer, account };
-  } catch {
-    return { issuer: "", account: "" };
-  }
-}
-
-function flashButtonLabel(btn, tempText, ms = 1000) {
-  const prev = btn.textContent;
-  btn.textContent = tempText;
-  setTimeout(() => {
-    btn.textContent = prev;
-  }, ms);
-}
-
-function formatTotpCode(code) {
-  return code && code.length === 6 ? `${code.slice(0, 3)} ${code.slice(3)}` : code || "";
-}
-
-function renderScannedQrCard(tab, otpauthUri, meta, staged) {
-  contentEl.replaceChildren();
-  const card = document.createElement("div");
-  card.className = "qr-card";
-
-  const title = document.createElement("div");
-  title.className = "qr-title";
-  title.textContent = "2FA QR copied · Paste into Bitwarden Desktop";
-
-  const sub = document.createElement("div");
-  sub.className = "qr-meta";
-  sub.textContent =
-    [meta.issuer, meta.account].filter(Boolean).join(" · ") || new URL(tab.url).host;
-
-  const codeEl = document.createElement("div");
-  codeEl.className = "qr-code";
-  codeEl.textContent = formatTotpCode(staged.totp);
-
-  const hint = document.createElement("div");
-  hint.className = "qr-meta";
-  hint.textContent =
-    "Save the Authenticator Key in Bitwarden Desktop, then click Fill Code (or focus the verification box on the page).";
-
-  const actions = document.createElement("div");
-  actions.className = "notice-actions";
-
-  const fillBtn = document.createElement("button");
-  fillBtn.className = "primary";
-  fillBtn.type = "button";
-  fillBtn.textContent = "Fill Code";
-  fillBtn.addEventListener("click", async () => {
-    const fillRes = await sendBg("popup-fill-totp", {
-      tabId: tab.id,
-      tabUrl: tab.url,
-    });
-    if (fillRes?.ok) {
-      window.close();
-      return;
-    }
-    if (fillRes?.error === "expired" || !fillRes?.totp) {
-      renderNotice("Staged 2FA code expired. Scan the QR code again.", "Scan Again", scanQrOnActiveTab);
-      return;
-    }
-    codeEl.textContent = formatTotpCode(fillRes.totp);
-    await navigator.clipboard.writeText(fillRes.totp).catch(() => {});
-    flashButtonLabel(fillBtn, "Code Copied", 1200);
-  });
-
-  const openDesktopBtn = document.createElement("button");
-  openDesktopBtn.type = "button";
-  openDesktopBtn.textContent = "Bitwarden";
-  openDesktopBtn.title = "Open Bitwarden Desktop to paste the Authenticator Key";
-  openDesktopBtn.addEventListener("click", () => {
-    callHost("focusDesktop");
-  });
-
-  const copyUriBtn = document.createElement("button");
-  copyUriBtn.type = "button";
-  copyUriBtn.textContent = "Copy URI";
-  copyUriBtn.addEventListener("click", async () => {
-    await navigator.clipboard.writeText(otpauthUri).catch(() => {});
-    flashButtonLabel(copyUriBtn, "Copied", 1000);
-  });
-
-  actions.append(fillBtn, openDesktopBtn, copyUriBtn);
-  card.append(title, sub, codeEl, hint, actions);
-  contentEl.appendChild(card);
-}
-
 async function scanQrOnActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id || !tab.url || !/^https?:/i.test(tab.url)) {
@@ -394,74 +296,20 @@ async function scanQrOnActiveTab() {
     return;
   }
 
-  if (typeof BarcodeDetector !== "function") {
-    renderNotice(
-      "This browser build does not expose BarcodeDetector for QR scanning.",
-      "Back",
-      load,
-    );
-    return;
-  }
-
-  renderEmpty("Scanning visible page for 2FA QR…");
-
-  const cap = await sendBg("popup-scan-qr", { windowId: tab.windowId });
-  if (!cap?.ok || !cap.dataUrl) {
-    renderNotice(`Failed to capture page: ${cap?.error || "unavailable"}`, "Retry", scanQrOnActiveTab);
-    return;
-  }
-
-  let codes;
-  try {
-    const blob = await (await fetch(cap.dataUrl)).blob();
-    const bitmap = await createImageBitmap(blob);
-    try {
-      const detector = new BarcodeDetector({ formats: ["qr_code"] });
-      codes = await detector.detect(bitmap);
-    } finally {
-      bitmap.close();
-    }
-  } catch (err) {
-    renderNotice(
-      `QR scan failed: ${err instanceof Error ? err.message : String(err)}`,
-      "Retry",
-      scanQrOnActiveTab,
-    );
-    return;
-  }
-
-  const match = (codes || []).find((c) => /^(otpauth:\/\/totp\/|steam:\/\/)/i.test(c.rawValue || ""));
-  if (!match) {
-    renderNotice(
-      "No 2FA QR code found in the visible area. Scroll the QR code into view and try again.",
-      "Retry",
-      scanQrOnActiveTab,
-    );
-    return;
-  }
-
-  const otpauthUri = match.rawValue.trim();
-  const meta = parseOtpAuthMeta(otpauthUri);
-  await navigator.clipboard.writeText(otpauthUri).catch(() => {});
-
-  const staged = await sendBg("popup-stage-totp", {
+  const res = await sendBg("popup-open-totp-scan", {
     tabId: tab.id,
-    uri: tab.url,
-    otpauthUri,
-    name: meta.issuer || new URL(tab.url).host,
-    userName: meta.account,
+    tabUrl: tab.url,
+    windowId: tab.windowId,
   });
-
-  if (!staged?.ok || !staged.totp) {
+  if (!res?.ok) {
     renderNotice(
-      `QR copied to clipboard, but failed to stage code: ${staged?.error || "invalid_totp"}`,
-      "Back",
-      load,
+      `Failed to start QR scan: ${res?.error || "unavailable"}`,
+      "Retry",
+      scanQrOnActiveTab,
     );
     return;
   }
-
-  renderScannedQrCard(tab, otpauthUri, meta, staged);
+  window.close();
 }
 
 lockBtn.addEventListener("click", async () => {

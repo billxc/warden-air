@@ -192,29 +192,6 @@
         display: flex;
         gap: 6px;
       }
-      .qr-card {
-        padding: 10px 12px;
-        border-radius: 8px;
-        background: var(--card);
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-      }
-      .qr-title {
-        font-weight: 600;
-        font-size: 12px;
-      }
-      .qr-meta {
-        font-size: 11px;
-        color: var(--muted);
-        word-break: break-all;
-      }
-      .qr-code {
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 20px;
-        font-weight: 600;
-        letter-spacing: 0.08em;
-      }
       kbd {
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         font-size: 10px;
@@ -241,7 +218,7 @@
     <footer>
       <span>Quick fill: <kbd>⌘⇧L</kbd></span>
       <div class="footer-actions">
-        <button id="scan-qr-btn" type="button" title="Scan a visible 2FA QR code on this page">Scan QR</button>
+        <button id="scan-qr-btn" type="button" title="Scan a visible TOTP QR code on this page">Scan TOTP QR</button>
         <button id="refresh-btn" type="button">Refresh</button>
       </div>
     </footer>

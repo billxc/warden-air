@@ -151,9 +151,37 @@ const POPOUT_WINDOW_WIDTH = 348;
 // Active in-flight passkey requests: `${tabId}:${requestId}` -> { tabId, context }
 const inFlightPasskeyRequests = new Map();
 const earlyAbortedPasskeyRequests = new Set();
+// Per-tab standalone 2FA QR scan prompt: tabId -> { scanId, tabUrl, senderWindowId, windowId, dataUrl }
+const pendingTotpScans = new Map();
+
+function clearPendingTotpScan(tabId, { closeWindow = true } = {}) {
+  const entry = pendingTotpScans.get(tabId);
+  if (!entry) return;
+  const winToClose = entry.windowId;
+  entry.windowId = null;
+  entry.dataUrl = null;
+  pendingTotpScans.delete(tabId);
+  if (closeWindow && winToClose != null) {
+    chrome.windows.remove(winToClose).catch(() => {});
+  }
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!changeInfo.url) return;
+  const entry = pendingTotpScans.get(tabId);
+  if (!entry) return;
+  try {
+    if (new URL(changeInfo.url).origin !== new URL(entry.tabUrl).origin) {
+      clearPendingTotpScan(tabId);
+    }
+  } catch {
+    clearPendingTotpScan(tabId);
+  }
+});
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearPendingSave(tabId);
+  clearPendingTotpScan(tabId);
   callHost("clearTotpHandoff", { tabId }).catch(() => {});
   for (const [key, entry] of inFlightPasskeyRequests) {
     if (entry.tabId === tabId) {
@@ -168,6 +196,12 @@ chrome.windows.onRemoved.addListener((windowId) => {
     if (entry.windowId === windowId) {
       entry.windowId = null;
       clearPendingSave(tabId, { closeWindow: false });
+    }
+  }
+  for (const [tabId, entry] of pendingTotpScans) {
+    if (entry.windowId === windowId) {
+      entry.windowId = null;
+      clearPendingTotpScan(tabId, { closeWindow: false });
     }
   }
 });
@@ -218,6 +252,33 @@ function callHost(action, params = {}) {
 function isTrustedExtensionPage(sender) {
   const extOrigin = chrome.runtime.getURL("");
   return !sender.tab && typeof sender.url === "string" && sender.url.startsWith(extOrigin);
+}
+
+function isTrustedTotpPrompt(sender, entry) {
+  const promptPrefix = chrome.runtime.getURL("totp-prompt.html");
+  if (sender.id !== chrome.runtime.id) return false;
+  if (typeof sender.url !== "string" || !sender.url.startsWith(promptPrefix)) return false;
+  if (sender.frameId != null && sender.frameId !== 0) return false;
+  if (
+    entry?.windowId != null &&
+    sender.tab?.windowId != null &&
+    sender.tab.windowId !== entry.windowId
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function resolveTotpPromptEntry(sender, msg) {
+  const tabId = Number(msg.tabId || 0);
+  const entry = pendingTotpScans.get(tabId);
+  if (!isTrustedTotpPrompt(sender, entry)) {
+    return { error: { ok: false, error: "forbidden_sender" } };
+  }
+  if (!entry || entry.scanId !== msg.scanId) {
+    return { error: { ok: false, error: "expired" } };
+  }
+  return { tabId, entry };
 }
 
 function isTrustedSavePrompt(sender, entry) {
@@ -658,45 +719,153 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return { ok: filled, totp: item.totp || null };
       }
 
-      case "popup-scan-qr": {
+      case "popup-open-totp-scan": {
         if (!isTrustedExtensionPage(sender)) {
           return { ok: false, error: "forbidden_sender" };
         }
-        const windowId = typeof msg.windowId === "number" ? msg.windowId : undefined;
+        const { tabId, tabUrl, windowId: senderWindowId } = msg;
+        if (!tabId || !tabUrl || !/^https?:/i.test(tabUrl)) {
+          return { ok: false, error: "invalid_target" };
+        }
+        let dataUrl;
         try {
-          const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
-          return { ok: true, dataUrl };
+          dataUrl = await chrome.tabs.captureVisibleTab(
+            typeof senderWindowId === "number" ? senderWindowId : undefined,
+            { format: "png" },
+          );
+        } catch (err) {
+          return { ok: false, error: err instanceof Error ? err.message : "capture_failed" };
+        }
+
+        const scanId = crypto.randomUUID();
+        const prev = pendingTotpScans.get(tabId);
+        if (prev?.windowId != null) {
+          try {
+            await chrome.windows.get(prev.windowId);
+            prev.scanId = scanId;
+            prev.tabUrl = tabUrl;
+            prev.senderWindowId = senderWindowId ?? prev.senderWindowId;
+            prev.dataUrl = null;
+            await chrome.runtime
+              .sendMessage({ type: "totp-prompt-refresh", tabId, scanId, tabUrl, dataUrl })
+              .catch(() => {});
+            await chrome.windows.update(prev.windowId, { focused: true }).catch(() => {});
+            return { ok: true };
+          } catch {
+            prev.windowId = null;
+          }
+        }
+
+        const entry = {
+          scanId,
+          tabUrl,
+          senderWindowId: typeof senderWindowId === "number" ? senderWindowId : null,
+          windowId: null,
+          dataUrl,
+        };
+        pendingTotpScans.set(tabId, entry);
+
+        const url = chrome.runtime.getURL(
+          `totp-prompt.html?tabId=${encodeURIComponent(tabId)}&scanId=${encodeURIComponent(scanId)}`,
+        );
+        try {
+          const win = await openTopRightPopoutWindow(
+            entry.senderWindowId,
+            url,
+            POPOUT_WINDOW_WIDTH,
+            355,
+          );
+          if (pendingTotpScans.get(tabId)?.scanId !== scanId) {
+            if (win?.id != null) chrome.windows.remove(win.id).catch(() => {});
+            return { ok: true };
+          }
+          entry.windowId = win?.id ?? null;
+          return { ok: true };
+        } catch (err) {
+          clearPendingTotpScan(tabId, { closeWindow: false });
+          return { ok: false, error: err instanceof Error ? err.message : "window_failed" };
+        }
+      }
+
+      case "totp-prompt-init": {
+        const { entry, error } = resolveTotpPromptEntry(sender, msg);
+        if (error) return error;
+        if (!entry.dataUrl) {
+          return { ok: false, error: "expired" };
+        }
+        const dataUrl = entry.dataUrl;
+        entry.dataUrl = null;
+        return { ok: true, tabUrl: entry.tabUrl, dataUrl };
+      }
+
+      case "totp-prompt-rescan": {
+        const { tabId, entry, error } = resolveTotpPromptEntry(sender, msg);
+        if (error) return error;
+        try {
+          const expectedOrigin = new URL(entry.tabUrl).origin;
+          let tab = await chrome.tabs.get(tabId);
+          if (!tab?.url || !/^https?:/i.test(tab.url) || new URL(tab.url).origin !== expectedOrigin) {
+            return { ok: false, error: "invalid_target" };
+          }
+          if (!tab.active) {
+            await chrome.tabs.update(tabId, { active: true });
+            tab = await chrome.tabs.get(tabId);
+            if (!tab?.active || !tab.url || new URL(tab.url).origin !== expectedOrigin) {
+              return { ok: false, error: "tab_not_active" };
+            }
+          }
+          const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+          const afterTab = await chrome.tabs.get(tabId);
+          if (!afterTab?.active || !afterTab.url || new URL(afterTab.url).origin !== expectedOrigin) {
+            return { ok: false, error: "tab_changed" };
+          }
+          entry.tabUrl = afterTab.url;
+          entry.senderWindowId = afterTab.windowId;
+          return { ok: true, tabUrl: afterTab.url, dataUrl };
         } catch (err) {
           return { ok: false, error: err instanceof Error ? err.message : "capture_failed" };
         }
       }
 
-      case "popup-stage-totp": {
-        if (!isTrustedExtensionPage(sender)) {
-          return { ok: false, error: "forbidden_sender" };
-        }
+      case "totp-prompt-stage": {
+        const { tabId, entry, error } = resolveTotpPromptEntry(sender, msg);
+        if (error) return error;
         return await callHost("stageTotpHandoff", {
-          tabId: msg.tabId ?? null,
-          uri: msg.uri,
+          tabId,
+          uri: entry.tabUrl,
           otpauthUri: msg.otpauthUri,
           name: msg.name || "",
           userName: msg.userName || "",
         });
       }
 
-      case "popup-fill-totp": {
-        if (!isTrustedExtensionPage(sender)) {
-          return { ok: false, error: "forbidden_sender" };
+      case "totp-prompt-fill": {
+        const { tabId, entry, error } = resolveTotpPromptEntry(sender, msg);
+        if (error) return error;
+        const totp = typeof msg.totp === "string" ? msg.totp.trim() : "";
+        if (!totp) {
+          return { ok: false, error: "invalid_totp" };
         }
-        const { tabId, tabUrl } = msg;
-        if (!tabId || !tabUrl || !/^https?:/i.test(tabUrl)) {
-          return { ok: false, error: "invalid_target" };
+        const expectedOrigin = new URL(entry.tabUrl).origin;
+        const filled = await fillTargetFrames(
+          { tabId, allFrames: true },
+          { totp },
+          expectedOrigin,
+          true,
+        );
+        if (filled) {
+          callHost("clearTotpHandoff", { tabId }).catch(() => {});
+          if (entry.senderWindowId != null) {
+            await chrome.windows.update(entry.senderWindowId, { focused: true }).catch(() => {});
+          }
         }
-        const result = await tryFillHandoffTotp(tabId, tabUrl);
-        if (!result) {
-          return { ok: false, error: "expired" };
-        }
-        return { ok: result.filled, totp: result.totp };
+        return { ok: filled };
+      }
+
+      case "totp-prompt-focus-desktop": {
+        const { error } = resolveTotpPromptEntry(sender, msg);
+        if (error) return error;
+        return await callHost("focusDesktop");
       }
 
       // Frame-scoped content-script operations (strictly bound to sender.url & sender.frameId)
