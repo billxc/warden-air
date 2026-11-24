@@ -1,6 +1,9 @@
 (() => {
-  const CANDIDATE_TYPES = new Set(["password", "email", "text", "tel"]);
-  const SEARCH_RE = /\b(search|query|find|filter|coupon|promo|otp|code|captcha)\b|搜索|查找|验证码/i;
+  const CANDIDATE_TYPES = new Set(["password", "email", "text", "tel", "number"]);
+  const SEARCH_RE = /\b(search|query|find|filter|coupon|promo|captcha)\b|搜索|查找|图形验证码/i;
+  const OTP_EXCLUDE_RE = /\b(captcha|zip|postal|cvv|cvc|card|search|query|coupon|promo)\b|图形验证码|搜索/i;
+  const OTP_HINT_RE =
+    /(^|[\s_-])(totp|otp|2fa|mfa|one.?time|auth.?code|verif(ication)?[\s_-]?code|security[\s_-]?code|passcode|mfa.?code|2fa.?code|token)($|[\s_-])|动态码|验证码|两步验证|双因素/i;
   const IS_MAC = navigator.platform?.toUpperCase().includes("MAC");
   const BIO_LABEL = IS_MAC ? "Touch ID" : "Windows Hello";
 
@@ -9,6 +12,15 @@
     'input[type="email"]',
     'input[type="text"]',
     'input[type="tel"]',
+    "input:not([type])",
+  ].join(",");
+
+  const OTP_SELECTOR = [
+    'input[autocomplete~="one-time-code"]',
+    'input[type="text"]',
+    'input[type="tel"]',
+    'input[type="number"]',
+    'input[type="password"]',
     "input:not([type])",
   ].join(",");
 
@@ -42,20 +54,21 @@
     input.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
+  function isPasswordField(el) {
+    return el instanceof HTMLInputElement && el.type === "password" && isFillable(el) && !looksLikeOtpField(el);
+  }
+
   function fillCredentials(anchor, username, password) {
     const localPasswords = anchor?.form
-      ? [...anchor.form.querySelectorAll('input[type="password"]')].filter(isFillable)
+      ? [...anchor.form.querySelectorAll('input[type="password"]')].filter(isPasswordField)
       : [];
     const passwordInputs =
       localPasswords.length > 0
         ? localPasswords
-        : [...document.querySelectorAll('input[type="password"]')].filter(isFillable);
+        : [...document.querySelectorAll('input[type="password"]')].filter(isPasswordField);
 
     if (passwordInputs.length > 0) {
-      const pwdInput =
-        anchor instanceof HTMLInputElement && anchor.type === "password" && isFillable(anchor)
-          ? anchor
-          : passwordInputs[0];
+      const pwdInput = isPasswordField(anchor) ? anchor : passwordInputs[0];
 
       let userInput =
         anchor instanceof HTMLInputElement &&
@@ -112,17 +125,107 @@
     if (!CANDIDATE_TYPES.has(type)) return false;
     if (el.getAttribute("role") === "searchbox") return false;
     const rect = el.getBoundingClientRect();
-    if (rect.width < 40 || rect.height < 14) return false;
+    const minWidth = el.maxLength === 1 ? 18 : 40;
+    if (rect.width < minWidth || rect.height < 14) return false;
     const style = window.getComputedStyle(el);
     return style.display !== "none" && style.visibility !== "hidden";
   }
 
-  function looksLikeSearchOrOtp(el) {
-    if (el.type === "password") return false;
+  function findSegmentedOtpGroup(anchor, expectedLength = 0) {
+    if (!isFillable(anchor) || anchor.maxLength !== 1) return null;
+    let fallback = null;
+    let parent = anchor.parentElement;
+    for (let depth = 0; depth < 4 && parent && parent !== document.body; depth++) {
+      const cells = [...parent.querySelectorAll(OTP_SELECTOR)].filter(
+        (el) => isFillable(el) && el.maxLength === 1,
+      );
+      if (cells.includes(anchor)) {
+        if (expectedLength > 0 && cells.length === expectedLength) {
+          return cells;
+        }
+        if (!fallback && cells.length >= 4 && cells.length <= 10) {
+          fallback = cells;
+        }
+      }
+      parent = parent.parentElement;
+    }
+    return fallback;
+  }
+
+  function hasSiblingPasswordField(el) {
+    const scope = el.form || document;
+    return [...scope.querySelectorAll('input[type="password"]')].some(
+      (p) => p !== el && isFillable(p),
+    );
+  }
+
+  function looksLikeOtpField(el) {
+    if (!(el instanceof HTMLInputElement)) return false;
     const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
     if (ac.includes("one-time-code")) return true;
+    if (
+      ac.includes("current-password") ||
+      ac.includes("new-password") ||
+      ac.includes("username")
+    ) {
+      return false;
+    }
+    if (findSegmentedOtpGroup(el)) return true;
+    const hint = `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""}`;
+    if (OTP_EXCLUDE_RE.test(hint)) return false;
+    if (OTP_HINT_RE.test(hint)) return true;
+    const inputMode = (el.getAttribute("inputmode") || "").toLowerCase();
+    if (
+      el.type !== "password" &&
+      (inputMode === "numeric" || el.type === "number") &&
+      el.maxLength >= 4 &&
+      el.maxLength <= 8 &&
+      !hasSiblingPasswordField(el)
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  function looksLikeSearch(el) {
+    if (el.type === "password") return false;
     const hint = `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""}`;
     return SEARCH_RE.test(hint);
+  }
+
+  function looksLikeSearchOrOtp(el) {
+    return looksLikeSearch(el) || looksLikeOtpField(el);
+  }
+
+  function fillOtpCode(anchor, code) {
+    if (!isFillable(anchor) || !code) return false;
+    const group = findSegmentedOtpGroup(anchor, code.length);
+    if (group) {
+      if (group.length < code.length) return false;
+      const first = group[0];
+      first.focus();
+      try {
+        const dt = new DataTransfer();
+        dt.setData("text/plain", code);
+        first.dispatchEvent(
+          new ClipboardEvent("paste", {
+            clipboardData: dt,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      } catch {}
+      if (group.slice(0, code.length).map((c) => c.value).join("") === code) {
+        return true;
+      }
+      for (let i = 0; i < code.length; i++) {
+        setInputValue(group[i], code[i]);
+        group[i].dispatchEvent(new KeyboardEvent("keyup", { key: code[i], bubbles: true }));
+      }
+      return group.slice(0, code.length).map((c) => c.value).join("") === code;
+    }
+    setInputValue(anchor, code);
+    return anchor.value === code;
   }
 
   function isExplicitLoginField(el) {
@@ -307,7 +410,7 @@
     }
   }
 
-  function renderLoginList(anchor, items) {
+  function renderItemList(anchor, items, toRowSpec) {
     activeAnchor = anchor;
     ensureOverlay();
     positionOverlay();
@@ -315,43 +418,99 @@
     panel.replaceChildren();
 
     for (const item of items.slice(0, 6)) {
+      const spec = toRowSpec(item);
       const row = document.createElement("div");
       row.className = "row";
 
       const icon = document.createElement("span");
       icon.className = "icon";
-      icon.textContent = "🔑";
+      icon.textContent = spec.icon;
 
       const meta = document.createElement("div");
       meta.className = "meta";
 
       const title = document.createElement("div");
       title.className = "title";
-      title.textContent = item.name || "(Untitled)";
+      title.textContent = spec.title;
 
       const sub = document.createElement("div");
       sub.className = "sub";
-      sub.textContent = item.userName || "(No username)";
+      sub.textContent = spec.sub;
 
       meta.append(title, sub);
       row.append(icon, meta);
 
-      if (item.hasTotp) {
+      if (spec.badge) {
         const badge = document.createElement("span");
         badge.className = "badge";
-        badge.textContent = "2FA";
+        badge.textContent = spec.badge;
         row.appendChild(badge);
       }
 
       row.addEventListener("click", (e) => {
         if (!e.isTrusted) return;
-        selectCredentialItem(anchor, item);
+        spec.onSelect();
       });
       panel.appendChild(row);
     }
   }
 
-  function renderUnlockPill(anchor, email) {
+  function renderLoginList(anchor, items) {
+    renderItemList(anchor, items, (item) => ({
+      icon: "🔑",
+      title: item.name || "(Untitled)",
+      sub: item.userName || "(No username)",
+      badge: item.hasTotp ? "2FA" : "",
+      onSelect: () => selectCredentialItem(anchor, item),
+    }));
+  }
+
+  function formatTotpDisplay(code) {
+    if (!code) return "";
+    return code.length === 6 ? `${code.slice(0, 3)} ${code.slice(3)}` : code;
+  }
+
+  async function selectTotpItem(anchor, itemMeta) {
+    ++requestSeq;
+    suppressFocus = true;
+    try {
+      const res = await chrome.runtime.sendMessage({
+        type: "content-fill-totp",
+        credentialId: itemMeta.credentialId || null,
+      });
+      if (!res?.ok || !res.totp) {
+        if (res?.error === "locked") {
+          renderUnlockPill(anchor, res.email, "totp");
+        } else {
+          hideOverlay();
+        }
+        return;
+      }
+      const filled = fillOtpCode(anchor, res.totp);
+      if (filled) {
+        showTransientStatus("✓ 2FA code filled", 900);
+      } else {
+        hideOverlay();
+      }
+    } finally {
+      suppressFocus = false;
+    }
+  }
+
+  function renderTotpList(anchor, items) {
+    renderItemList(anchor, items, (item) => ({
+      icon: "🔐",
+      title: item.totp ? `2FA · ${formatTotpDisplay(item.totp)}` : item.name || "(Untitled)",
+      sub: [item.name, item.userName].filter(Boolean).join(" · ") || "Verification code",
+      badge: item.remainingSeconds ? `${item.remainingSeconds}s` : "2FA",
+      onSelect: () => selectTotpItem(anchor, item),
+    }));
+  }
+
+  function renderUnlockPill(anchor, email, mode = "login") {
+    const isTotp = mode === "totp";
+    const idleTitle = isTotp ? `Fill 2FA with ${BIO_LABEL}` : `Unlock with ${BIO_LABEL}`;
+
     activeAnchor = anchor;
     ensureOverlay();
     positionOverlay();
@@ -370,7 +529,7 @@
 
     const title = document.createElement("div");
     title.className = "title";
-    title.textContent = `Unlock with ${BIO_LABEL}`;
+    title.textContent = idleTitle;
 
     const sub = document.createElement("div");
     sub.className = "sub";
@@ -386,14 +545,18 @@
       ++requestSeq;
       suppressFocus = true;
       title.textContent = `${BIO_LABEL}…`;
-      sub.textContent = "Verify biometrics to autofill";
+      sub.textContent = isTotp
+        ? "Verify biometrics to fill 2FA code"
+        : "Verify biometrics to autofill";
 
-      const res = await chrome.runtime.sendMessage({ type: "content-unlock" });
+      const res = await chrome.runtime.sendMessage({
+        type: isTotp ? "content-unlock-totp" : "content-unlock",
+      });
 
       if (!res?.ok) {
         unlocking = false;
         suppressFocus = false;
-        title.textContent = `Unlock with ${BIO_LABEL}`;
+        title.textContent = idleTitle;
         sub.textContent =
           res?.error === "biometric_canceled_or_disabled"
             ? `Enable 'Allow browser integration' & ${BIO_LABEL} in Desktop`
@@ -403,13 +566,16 @@
 
       const items = res.items || [];
       if (items.length === 1) {
-        await selectCredentialItem(anchor, items[0]);
+        await (isTotp ? selectTotpItem : selectCredentialItem)(anchor, items[0]);
       } else if (items.length > 1) {
         suppressFocus = false;
-        renderLoginList(anchor, items);
+        (isTotp ? renderTotpList : renderLoginList)(anchor, items);
       } else {
         suppressFocus = false;
-        showTransientStatus("No login saved for this site", 1200);
+        showTransientStatus(
+          isTotp ? "No 2FA code saved for this site" : "No login saved for this site",
+          1200,
+        );
       }
     });
 
@@ -452,7 +618,34 @@
     if (suppressFocus) return;
     if (!isAutofillEligiblePage()) return;
     if (!isVisibleEditableInput(el)) return;
-    if (looksLikeSearchOrOtp(el)) return;
+
+    if (looksLikeOtpField(el)) {
+      const seq = ++requestSeq;
+      let res;
+      try {
+        res = await chrome.runtime.sendMessage({ type: "content-query-totp" });
+      } catch {
+        return;
+      }
+
+      if (seq !== requestSeq || document.activeElement !== el) return;
+
+      if (res?.ok && res.items?.length > 0) {
+        renderTotpList(el, res.items);
+        return;
+      }
+
+      if (!res?.ok && res?.error === "locked") {
+        renderUnlockPill(el, res.email, "totp");
+        return;
+      }
+
+      hideOverlay();
+      return;
+    }
+
+    if ((el.getAttribute("type") || "text").toLowerCase() === "number") return;
+    if (looksLikeSearch(el)) return;
 
     const seq = ++requestSeq;
     let res;
@@ -579,7 +772,9 @@
 
   function captureCredentialsFromScope(scope) {
     const root = scope || document;
-    const pwds = [...root.querySelectorAll('input[type="password"]')];
+    const pwds = [...root.querySelectorAll('input[type="password"]')].filter(
+      (el) => !looksLikeOtpField(el),
+    );
     const editedPwds = pwds.filter((el) => userEditedInputs.has(el) && el.value.length > 0);
 
     let username = "";
@@ -644,7 +839,7 @@
 
   function hasActiveEditedPasswordOnPage() {
     return [...document.querySelectorAll('input[type="password"]')].some(
-      (el) => userEditedInputs.has(el) && el.value.length > 0 && isFillable(el),
+      (el) => userEditedInputs.has(el) && el.value.length > 0 && isPasswordField(el),
     );
   }
 

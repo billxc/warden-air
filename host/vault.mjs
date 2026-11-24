@@ -226,7 +226,7 @@ export function isAutofillEligibleUrl(rawUrl) {
 }
 
 // Match rank: 5 = exact URL, 4 = exact host+port, 3 = same hostname (different port), 2 = base domain, 0 = no match
-function matchUriScore(targetUrlObj, savedUriStr, effectiveMatchType) {
+export function matchUriScore(targetUrlObj, savedUriStr, effectiveMatchType) {
   if (!savedUriStr || effectiveMatchType === 5) return 0; // 5 = Never
 
   if (effectiveMatchType === 3) {
@@ -303,11 +303,36 @@ function decodeBase32(input) {
   return Buffer.from(out);
 }
 
-export function generateTotpCode(totpRaw) {
+const STEAM_ALPHABET = "23456789BCDFGHJKMNPQRTVWXY";
+
+function computeTotpForCounter(algo, keyBytes, counter, digits, isSteam) {
+  const counterBuf = Buffer.alloc(8);
+  counterBuf.writeBigUInt64BE(BigInt(counter));
+  const digest = crypto.createHmac(algo, keyBytes).update(counterBuf).digest();
+  const offset = digest[digest.length - 1] & 0x0f;
+  let binary =
+    ((digest[offset] & 0x7f) << 24) |
+    ((digest[offset + 1] & 0xff) << 16) |
+    ((digest[offset + 2] & 0xff) << 8) |
+    (digest[offset + 3] & 0xff);
+
+  if (isSteam) {
+    let out = "";
+    for (let i = 0; i < 5; i++) {
+      out += STEAM_ALPHABET[binary % STEAM_ALPHABET.length];
+      binary = Math.floor(binary / STEAM_ALPHABET.length);
+    }
+    return out;
+  }
+
+  return String(binary % 10 ** digits).padStart(digits, "0");
+}
+
+export function generateTotpWindow(totpRaw, nowMs = Date.now()) {
   if (!totpRaw) return null;
   try {
     const trimmed = totpRaw.trim();
-    if (!trimmed || /^steam:\/\//i.test(trimmed) || /^otpauth:\/\/hotp\//i.test(trimmed)) {
+    if (!trimmed) {
       return null;
     }
 
@@ -315,8 +340,13 @@ export function generateTotpCode(totpRaw) {
     let period = 30;
     let digits = 6;
     let algo = "sha1";
+    let isSteam = false;
 
-    if (/^otpauth:\/\//i.test(trimmed)) {
+    if (/^steam:\/\//i.test(trimmed)) {
+      isSteam = true;
+      secret = trimmed.slice("steam://".length);
+      digits = 5;
+    } else if (/^otpauth:\/\//i.test(trimmed)) {
       const u = new URL(trimmed);
       if (u.hostname.toLowerCase() !== "totp") return null;
       secret = u.searchParams.get("secret") || "";
@@ -331,8 +361,7 @@ export function generateTotpCode(totpRaw) {
       !Number.isInteger(period) ||
       period <= 0 ||
       !Number.isInteger(digits) ||
-      digits < 6 ||
-      digits > 10
+      (!isSteam && (digits < 6 || digits > 10))
     ) {
       return null;
     }
@@ -340,22 +369,20 @@ export function generateTotpCode(totpRaw) {
     const keyBytes = decodeBase32(secret);
     if (!keyBytes.length) return null;
 
-    const counter = Math.floor(Date.now() / 1000 / period);
-    const counterBuf = Buffer.alloc(8);
-    counterBuf.writeBigUInt64BE(BigInt(counter));
+    const counter = Math.floor(nowMs / 1000 / period);
+    const code = computeTotpForCounter(algo, keyBytes, counter, digits, isSteam);
+    const nextCode = computeTotpForCounter(algo, keyBytes, counter + 1, digits, isSteam);
+    const expiresAt = (counter + 1) * period * 1000;
+    const nextExpiresAt = (counter + 2) * period * 1000;
 
-    const digest = crypto.createHmac(algo, keyBytes).update(counterBuf).digest();
-    const offset = digest[digest.length - 1] & 0x0f;
-    const binary =
-      ((digest[offset] & 0x7f) << 24) |
-      ((digest[offset + 1] & 0xff) << 16) |
-      ((digest[offset + 2] & 0xff) << 8) |
-      (digest[offset + 3] & 0xff);
-
-    return String(binary % 10 ** digits).padStart(digits, "0");
+    return { code, nextCode, period, expiresAt, nextExpiresAt };
   } catch {
     return null;
   }
+}
+
+export function generateTotpCode(totpRaw, nowMs = Date.now()) {
+  return generateTotpWindow(totpRaw, nowMs)?.code ?? null;
 }
 
 function createOrgKeyResolver(store, userId, userKeyBuf) {
@@ -396,7 +423,11 @@ function createOrgKeyResolver(store, userId, userKeyBuf) {
 }
 
 export function queryLocalVaultForUrl(userId, userKeyBuf, targetUri, options = {}) {
-  const { metadataOnly = false, credentialIdFilter = null } = options;
+  const {
+    metadataOnly = false,
+    credentialIdFilter = null,
+    includeTotpWindow = false,
+  } = options;
 
   let targetUrl;
   try {
@@ -445,12 +476,17 @@ export function queryLocalVaultForUrl(userId, userKeyBuf, targetUri, options = {
       if (!itemKey) continue;
 
       let bestScore = 0;
+      const uriRules = includeTotpWindow ? [] : null;
       for (const u of cipher.login.uris) {
         if (!u?.uri) continue;
         try {
           const plainUri = decryptSymString(u.uri, itemKey);
-          const score = matchUriScore(targetUrl, plainUri, u.match ?? defaultMatch);
+          const effectiveMatch = u.match ?? defaultMatch;
+          const score = matchUriScore(targetUrl, plainUri, effectiveMatch);
           if (score > bestScore) bestScore = score;
+          if (uriRules && plainUri && effectiveMatch !== 5) {
+            uriRules.push({ uri: plainUri, match: effectiveMatch });
+          }
         } catch {}
       }
 
@@ -468,23 +504,28 @@ export function queryLocalVaultForUrl(userId, userKeyBuf, targetUri, options = {
             userId,
             name,
             userName,
-            hasTotp: generateTotpCode(totpRaw) != null,
+            hasTotp: generateTotpWindow(totpRaw) != null,
             _score: bestScore,
             _lastUsed: Number(lastUsedDate) || 0,
           });
         } else {
           const password = decryptSymString(cipher.login.password, itemKey) || "";
-          const totp = generateTotpCode(totpRaw);
-          matches.push({
+          const totpWindow = generateTotpWindow(totpRaw);
+          const item = {
             credentialId: cipherId,
             userId,
             name,
             userName,
             password,
-            totp,
+            totp: totpWindow?.code ?? null,
             _score: bestScore,
             _lastUsed: Number(lastUsedDate) || 0,
-          });
+          };
+          if (includeTotpWindow && totpWindow) {
+            item._totpWindow = totpWindow;
+            item._uriRules = uriRules;
+          }
+          matches.push(item);
         }
       } catch {}
     }
@@ -522,6 +563,17 @@ export function isEligiblePasswordCipher(cipher) {
       cipher.type === 1 &&
       !cipher.reprompt &&
       cipher.login?.password &&
+      cipher.login?.uris?.length,
+  );
+}
+
+function isEligibleTotpCipher(cipher) {
+  return Boolean(
+    cipher &&
+      cipher.deletedDate == null &&
+      cipher.type === 1 &&
+      !cipher.reprompt &&
+      cipher.login?.totp &&
       cipher.login?.uris?.length,
   );
 }
@@ -585,6 +637,7 @@ export class VaultUriCache {
       state = {
         cipherRules: new Map(),
         loginEntries: new Map(),
+        totpCipherRules: new Map(),
         passkeyRpIds: new Map(),
         indexedPasskeyRevisions: new Map(),
         hasUnindexedPasskey: false,
@@ -611,14 +664,16 @@ export class VaultUriCache {
 
     const cipherRules = new Map();
     const loginEntries = new Map();
+    const totpCipherRules = new Map();
     const passkeyRpIds = new Map();
     const indexedPasskeyRevisions = new Map();
 
     try {
       for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
         const hasPwd = isEligiblePasswordCipher(cipher);
+        const hasTotp = isEligibleTotpCipher(cipher);
         const hasPk = isEligiblePasskeyCipher(cipher);
-        if (!hasPwd && !hasPk) continue;
+        if (!hasPwd && !hasTotp && !hasPk) continue;
 
         const baseKey = cipher.organizationId ? orgKeys.getOrgKey(cipher.organizationId) : userKeyBuf;
         if (!baseKey) continue;
@@ -636,7 +691,7 @@ export class VaultUriCache {
         if (!itemKey) continue;
 
         try {
-          if (hasPwd) {
+          if (hasPwd || hasTotp) {
             const rules = [];
             for (const u of cipher.login.uris) {
               if (!u?.uri) continue;
@@ -649,28 +704,38 @@ export class VaultUriCache {
               } catch {}
             }
             if (rules.length > 0) {
-              cipherRules.set(cipherId, rules);
-              let name = "";
-              let userHmac = null;
-              let passHmac = null;
-              try {
-                name = decryptSymString(cipher.name, itemKey) || "";
-                const userName = decryptSymString(cipher.login.username, itemKey) || "";
-                const password = decryptSymString(cipher.login.password, itemKey) || "";
-                userHmac = this.#hmac("u", userName);
-                passHmac = this.#hmac("p", password);
-              } catch {}
-              loginEntries.set(cipherId, {
-                credentialId: cipherId,
-                rules,
-                rulesFresh: true,
-                revisionDate: cipher.revisionDate || "",
-                recordedMtimeMs: mtimeMs,
-                editable: isSafeUpdateCipherRaw(cipher, defaultMatch),
-                name,
-                userHmac,
-                passHmac,
-              });
+              if (hasPwd) {
+                cipherRules.set(cipherId, rules);
+                let name = "";
+                let userHmac = null;
+                let passHmac = null;
+                try {
+                  name = decryptSymString(cipher.name, itemKey) || "";
+                  const userName = decryptSymString(cipher.login.username, itemKey) || "";
+                  const password = decryptSymString(cipher.login.password, itemKey) || "";
+                  userHmac = this.#hmac("u", userName);
+                  passHmac = this.#hmac("p", password);
+                } catch {}
+                loginEntries.set(cipherId, {
+                  credentialId: cipherId,
+                  rules,
+                  rulesFresh: true,
+                  revisionDate: cipher.revisionDate || "",
+                  recordedMtimeMs: mtimeMs,
+                  editable: isSafeUpdateCipherRaw(cipher, defaultMatch),
+                  name,
+                  userHmac,
+                  passHmac,
+                });
+              }
+              if (hasTotp) {
+                try {
+                  const totpRaw = decryptSymString(cipher.login.totp, itemKey);
+                  if (generateTotpWindow(totpRaw) != null) {
+                    totpCipherRules.set(cipherId, rules);
+                  }
+                } catch {}
+              }
             }
           }
 
@@ -701,6 +766,7 @@ export class VaultUriCache {
     this.#byUser.set(userId, {
       cipherRules,
       loginEntries,
+      totpCipherRules,
       passkeyRpIds,
       indexedPasskeyRevisions,
       hasUnindexedPasskey: false,
@@ -813,6 +879,7 @@ export class VaultUriCache {
     if (!dataFile) {
       state.cipherRules.clear();
       state.loginEntries.clear();
+      state.totpCipherRules.clear();
       state.passkeyRpIds.clear();
       state.hasUnindexedPasskey = false;
       return;
@@ -882,8 +949,12 @@ export class VaultUriCache {
           item.editable = isSafeUpdateCipherRaw(raw, defaultMatch);
         }
       }
-
       if (state.initialized) {
+        for (const cipherId of state.totpCipherRules.keys()) {
+          if (!isEligibleTotpCipher(ciphersMap[cipherId])) {
+            state.totpCipherRules.delete(cipherId);
+          }
+        }
         for (const cipherId of state.passkeyRpIds.keys()) {
           if (!isEligiblePasskeyCipher(ciphersMap[cipherId])) {
             state.passkeyRpIds.delete(cipherId);
@@ -1011,6 +1082,28 @@ export class VaultUriCache {
     return false;
   }
 
+  #matchesRuleMap(ruleMap, targetUrl, defaultMatch) {
+    for (const rules of ruleMap.values()) {
+      for (const rule of rules) {
+        if (matchUriScore(targetUrl, rule.uri, rule.match ?? defaultMatch) > 0) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  hasTotpMatch(userId, targetUri) {
+    if (!userId || !isAutofillEligibleUrl(targetUri)) return false;
+
+    const state = this.#byUser.get(userId);
+    if (!state || !state.initialized) return false;
+
+    this.#pruneStaleCiphers(userId, state);
+
+    return this.#matchesRuleMap(state.totpCipherRules, new URL(targetUri), state.defaultMatch);
+  }
+
   hasMatch(userId, targetUri) {
     if (!userId || !isAutofillEligibleUrl(targetUri)) return false;
 
@@ -1020,12 +1113,8 @@ export class VaultUriCache {
     this.#pruneStaleCiphers(userId, state);
 
     const targetUrl = new URL(targetUri);
-    for (const rules of state.cipherRules.values()) {
-      for (const rule of rules) {
-        if (matchUriScore(targetUrl, rule.uri, rule.match ?? state.defaultMatch) > 0) {
-          return true;
-        }
-      }
+    if (this.#matchesRuleMap(state.cipherRules, targetUrl, state.defaultMatch)) {
+      return true;
     }
     for (const rule of state.savedRules.values()) {
       if (matchUriScore(targetUrl, rule.uri, rule.match ?? state.defaultMatch) > 0) {

@@ -154,6 +154,7 @@ const earlyAbortedPasskeyRequests = new Set();
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearPendingSave(tabId);
+  callHost("clearTotpHandoff", { tabId }).catch(() => {});
   for (const [key, entry] of inFlightPasskeyRequests) {
     if (entry.tabId === tabId) {
       inFlightPasskeyRequests.delete(key);
@@ -242,13 +243,30 @@ async function flashBadge(tabId, text, color) {
   }, 2200);
 }
 
-async function fillTargetFrames(target, item, expectedOrigin) {
+async function fillTargetFrames(target, item, expectedOrigin, totpOnly = false) {
   const results = await chrome.scripting.executeScript({
     target,
     func: applyCredentialsToDom,
-    args: [item.userName ?? "", item.password ?? "", item.totp ?? null, expectedOrigin],
+    args: [item.userName ?? "", item.password ?? "", item.totp ?? null, expectedOrigin, totpOnly],
   });
   return results.some((r) => r?.result?.filled);
+}
+
+async function tryFillHandoffTotp(tabId, tabUrl) {
+  const fresh = await callHost("getTotp", {
+    uri: tabUrl,
+    tabId,
+    passive: true,
+    consume: false,
+  });
+  const totp = fresh?.ok && fresh.source === "handoff" ? fresh.items?.[0]?.totp : null;
+  if (!totp) return null;
+  const expectedOrigin = new URL(tabUrl).origin;
+  const filled = await fillTargetFrames({ tabId, allFrames: true }, { totp }, expectedOrigin, true);
+  if (filled) {
+    await callHost("getTotp", { uri: tabUrl, tabId, consume: true }).catch(() => {});
+  }
+  return { filled, totp };
 }
 
 function resolvePasskeySenderContext(sender, data) {
@@ -572,16 +590,24 @@ async function handlePasskeyRequest(sender, op, requestId, rawData) {
   return normalized;
 }
 
-// Cmd+Shift+L: if locked, prompts biometrics in-place and immediately fills same-origin frames
+// Cmd+Shift+L: uses ephemeral TOTP handoff on 2FA steps without re-prompting; otherwise fills login/OTP
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== "fill-active-tab") return;
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id || !tab.url || !/^https?:/i.test(tab.url)) return;
 
-  let res = await callHost("getLogins", { uri: tab.url });
+  const expectedOrigin = new URL(tab.url).origin;
+
+  const handoffResult = await tryFillHandoffTotp(tab.id, tab.url);
+  if (handoffResult?.filled) {
+    await flashBadge(tab.id, "2FA", "#16a34a");
+    return;
+  }
+
+  let res = await callHost("getLogins", { uri: tab.url, tabId: tab.id });
   if (!res.ok && res.error === "locked") {
-    res = await callHost("unlock", { uri: tab.url });
+    res = await callHost("unlock", { uri: tab.url, tabId: tab.id });
   }
 
   if (!res.ok) {
@@ -595,7 +621,6 @@ chrome.commands.onCommand.addListener(async (command) => {
   }
 
   const top = res.items[0];
-  const expectedOrigin = new URL(tab.url).origin;
   const filled = await fillTargetFrames({ tabId: tab.id, allFrames: true }, top, expectedOrigin);
   await flashBadge(
     tab.id,
@@ -623,7 +648,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!tabId || !tabUrl || !credentialId || !/^https?:/i.test(tabUrl)) {
           return { ok: false, error: "invalid_target" };
         }
-        const res = await callHost("getLogins", { uri: tabUrl, credentialId });
+        const res = await callHost("getLogins", { uri: tabUrl, tabId, credentialId });
         if (!res.ok || !res.items?.length) {
           return { ok: false, error: res.error || "not_found" };
         }
@@ -631,6 +656,47 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const expectedOrigin = new URL(tabUrl).origin;
         const filled = await fillTargetFrames({ tabId, allFrames: true }, item, expectedOrigin);
         return { ok: filled, totp: item.totp || null };
+      }
+
+      case "popup-scan-qr": {
+        if (!isTrustedExtensionPage(sender)) {
+          return { ok: false, error: "forbidden_sender" };
+        }
+        const windowId = typeof msg.windowId === "number" ? msg.windowId : undefined;
+        try {
+          const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+          return { ok: true, dataUrl };
+        } catch (err) {
+          return { ok: false, error: err instanceof Error ? err.message : "capture_failed" };
+        }
+      }
+
+      case "popup-stage-totp": {
+        if (!isTrustedExtensionPage(sender)) {
+          return { ok: false, error: "forbidden_sender" };
+        }
+        return await callHost("stageTotpHandoff", {
+          tabId: msg.tabId ?? null,
+          uri: msg.uri,
+          otpauthUri: msg.otpauthUri,
+          name: msg.name || "",
+          userName: msg.userName || "",
+        });
+      }
+
+      case "popup-fill-totp": {
+        if (!isTrustedExtensionPage(sender)) {
+          return { ok: false, error: "forbidden_sender" };
+        }
+        const { tabId, tabUrl } = msg;
+        if (!tabId || !tabUrl || !/^https?:/i.test(tabUrl)) {
+          return { ok: false, error: "invalid_target" };
+        }
+        const result = await tryFillHandoffTotp(tabId, tabUrl);
+        if (!result) {
+          return { ok: false, error: "expired" };
+        }
+        return { ok: result.filled, totp: result.totp };
       }
 
       // Frame-scoped content-script operations (strictly bound to sender.url & sender.frameId)
@@ -641,8 +707,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         return await callHost("getLogins", {
           uri: frameUrl,
+          tabId: sender.tab.id,
           metadataOnly: true,
           passive: true,
+        });
+      }
+
+      case "content-query-totp": {
+        const frameUrl = sender.url;
+        if (!sender.tab?.id || !frameUrl || !/^https?:/i.test(frameUrl)) {
+          return { ok: false, error: "unsupported_url" };
+        }
+        return await callHost("getTotp", {
+          uri: frameUrl,
+          tabId: sender.tab.id,
+          passive: true,
+          consume: false,
         });
       }
 
@@ -651,7 +731,52 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!sender.tab?.id || !frameUrl || !/^https?:/i.test(frameUrl)) {
           return { ok: false, error: "unsupported_url" };
         }
-        return await callHost("unlock", { uri: frameUrl, metadataOnly: true });
+        return await callHost("unlock", {
+          uri: frameUrl,
+          tabId: sender.tab.id,
+          metadataOnly: true,
+        });
+      }
+
+      case "content-unlock-totp": {
+        const frameUrl = sender.url;
+        if (!sender.tab?.id || !frameUrl || !/^https?:/i.test(frameUrl)) {
+          return { ok: false, error: "unsupported_url" };
+        }
+        const res = await callHost("unlock", {
+          uri: frameUrl,
+          tabId: sender.tab.id,
+          metadataOnly: true,
+        });
+        if (!res?.ok) return res;
+        const totpItems = (res.items || []).filter((item) => item.hasTotp);
+        if (totpItems.length === 0) {
+          await callHost("lock").catch(() => {});
+        }
+        return { ...res, items: totpItems };
+      }
+
+      case "content-fill-totp": {
+        const frameUrl = sender.url;
+        const tabId = sender.tab?.id;
+        const frameId = sender.frameId;
+        if (!tabId || frameId == null || !frameUrl || !/^https?:/i.test(frameUrl)) {
+          return { ok: false, error: "invalid_frame" };
+        }
+        const res = await callHost("getTotp", {
+          uri: frameUrl,
+          tabId,
+          credentialId: msg.credentialId || null,
+          consume: true,
+        });
+        if (!res.ok || !res.items?.length) {
+          return { ok: false, error: res.error || "locked", email: res.email };
+        }
+        const item = res.items[0];
+        return {
+          ok: true,
+          totp: item.totp ?? null,
+        };
       }
 
       case "content-fill-item": {
@@ -663,6 +788,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         const res = await callHost("getLogins", {
           uri: frameUrl,
+          tabId,
           credentialId: msg.credentialId,
         });
         if (!res.ok || !res.items?.length) {

@@ -26,9 +26,11 @@ import {
   VaultUriCache,
   decryptSymString,
   encryptSymEncString,
+  generateTotpWindow,
   hasAnyPasskeyInLocalStore,
   isAutofillEligibleUrl,
   isSafeUpdateCipherRaw,
+  matchUriScore,
   queryLocalVaultForUrl,
   readAccountsFromLocalStore,
   resolveBitwardenDataFile,
@@ -37,6 +39,8 @@ import {
 const DESKTOP_PROXY = resolveDesktopProxyPath();
 const HOST_VERSION = "0.4.0";
 const PENDING_UNLOCK_MS = 60_000; // 60s window to pick an item after metadata-only unlock
+const TOTP_HANDOFF_TTL_MS = 90_000; // Short-lived single-item code handoff (no secret stored)
+const MAX_TOTP_HANDOFFS = 16;
 const HEARTBEAT_MS = 10_000;
 const SLEEP_GAP_MS = 30_000;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
@@ -45,11 +49,177 @@ const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const unlockedKeys = new Map();
 // Long-lived in-memory URI rule index (no usernames/passwords; survives wipeAllKeys)
 const vaultUriCache = new VaultUriCache();
+// Per-tab ephemeral TOTP handoffs: scopeKey -> { userId, origin, uriRules, credentialId, name, userName, codes, expiresAt, timer }
+const pendingTotpHandoffs = new Map();
 let unlockInFlight = null;
 let pendingTimer = null;
 let lockEpoch = 0;
 
-function wipeAllKeys() {
+function toHandoffScopeKey(clientId, tabId) {
+  const c = clientId != null && clientId !== "" ? String(clientId) : "0";
+  const t = tabId != null && tabId !== "" ? String(tabId) : "default";
+  return `${c}:${t}`;
+}
+
+function clearTotpHandoffByKey(key) {
+  const entry = pendingTotpHandoffs.get(key);
+  if (entry) {
+    clearTimeout(entry.timer);
+    pendingTotpHandoffs.delete(key);
+  }
+}
+
+function clearTotpHandoff({ clientId = undefined, tabId = undefined } = {}) {
+  if (clientId !== undefined && tabId !== undefined) {
+    clearTotpHandoffByKey(toHandoffScopeKey(clientId, tabId));
+    return;
+  }
+  if (clientId !== undefined) {
+    const prefix = `${clientId}:`;
+    for (const key of pendingTotpHandoffs.keys()) {
+      if (key.startsWith(prefix)) {
+        clearTotpHandoffByKey(key);
+      }
+    }
+    return;
+  }
+  for (const entry of pendingTotpHandoffs.values()) {
+    clearTimeout(entry.timer);
+  }
+  pendingTotpHandoffs.clear();
+}
+
+function storeTotpHandoff({
+  clientId = 0,
+  tabId = null,
+  userId = null,
+  uri,
+  uriRules = null,
+  credentialId = null,
+  name = "",
+  userName = "",
+  totpWindow,
+}) {
+  if (!uri || !totpWindow?.code) return null;
+  let parsed;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return null;
+  }
+  const now = Date.now();
+  const expiresAt = Math.min(now + TOTP_HANDOFF_TTL_MS, totpWindow.nextExpiresAt);
+  if (expiresAt <= now) return null;
+
+  const key = toHandoffScopeKey(clientId, tabId);
+  clearTotpHandoffByKey(key);
+  if (pendingTotpHandoffs.size >= MAX_TOTP_HANDOFFS) {
+    const oldestKey = pendingTotpHandoffs.keys().next().value;
+    if (oldestKey !== undefined) clearTotpHandoffByKey(oldestKey);
+  }
+
+  const timer = setTimeout(() => clearTotpHandoffByKey(key), Math.max(1000, expiresAt - now));
+  timer.unref();
+  const entry = {
+    userId,
+    origin: parsed.origin,
+    uriRules: Array.isArray(uriRules) && uriRules.length > 0 ? uriRules : null,
+    credentialId,
+    name: name || parsed.host,
+    userName: userName || "",
+    codes: [
+      { code: totpWindow.code, expiresAt: totpWindow.expiresAt },
+      { code: totpWindow.nextCode, expiresAt: totpWindow.nextExpiresAt },
+    ],
+    expiresAt,
+    timer,
+  };
+  pendingTotpHandoffs.set(key, entry);
+  return entry;
+}
+
+function peekTotpHandoff(
+  uri,
+  { clientId = 0, tabId = null, credentialIdFilter = null, activeUserId = null } = {},
+) {
+  if (!uri) return null;
+  const key = toHandoffScopeKey(clientId, tabId);
+  const handoff = pendingTotpHandoffs.get(key);
+  if (!handoff) return null;
+
+  const now = Date.now();
+  if (now >= handoff.expiresAt) {
+    clearTotpHandoffByKey(key);
+    return null;
+  }
+  if (handoff.userId && handoff.userId !== activeUserId) {
+    clearTotpHandoffByKey(key);
+    return null;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return null;
+  }
+
+  const uriMatched = handoff.uriRules
+    ? handoff.uriRules.some((r) => matchUriScore(parsed, r.uri, r.match) > 0)
+    : parsed.origin === handoff.origin;
+  if (!uriMatched) {
+    return null;
+  }
+
+  if (credentialIdFilter && handoff.credentialId !== credentialIdFilter) {
+    return null;
+  }
+
+  const active = handoff.codes.find((c) => c.expiresAt > now);
+  if (!active) {
+    clearTotpHandoffByKey(key);
+    return null;
+  }
+  return {
+    credentialId: handoff.credentialId,
+    name: handoff.name,
+    userName: handoff.userName,
+    totp: active.code,
+    hasTotp: true,
+    expiresAt: active.expiresAt,
+    remainingSeconds: remainingTotpSeconds(active.expiresAt, now),
+  };
+}
+
+function remainingTotpSeconds(expiresAt, now = Date.now()) {
+  return Math.max(1, Math.ceil((expiresAt - now) / 1000));
+}
+
+function syncTotpHandoffForItems({ clientId, tabId, userId, uri, items }) {
+  if (!uri || items.length === 0) return;
+  const top = items[0];
+  if (top._totpWindow) {
+    storeTotpHandoff({
+      clientId,
+      tabId: tabId ?? null,
+      userId,
+      uri,
+      uriRules: top._uriRules,
+      credentialId: top.credentialId,
+      name: top.name,
+      userName: top.userName,
+      totpWindow: top._totpWindow,
+    });
+  } else {
+    clearTotpHandoff({ clientId, tabId: tabId ?? null });
+  }
+}
+
+function stripInternalItemFields(items) {
+  return items.map(({ _totpWindow, _uriRules, ...rest }) => rest);
+}
+
+function wipeAllKeys({ clearTotp = false } = {}) {
   lockEpoch += 1;
   clearTimeout(pendingTimer);
   pendingTimer = null;
@@ -57,6 +227,9 @@ function wipeAllKeys() {
     entry.key.fill(0);
   }
   unlockedKeys.clear();
+  if (clearTotp) {
+    clearTotpHandoff();
+  }
 }
 
 function peekUnlockedKey(userId) {
@@ -82,12 +255,17 @@ let lastTick = Date.now();
 setInterval(() => {
   const now = Date.now();
   if (now - lastTick > SLEEP_GAP_MS) {
-    wipeAllKeys();
+    wipeAllKeys({ clearTotp: true });
   } else {
     for (const [, entry] of unlockedKeys) {
       if (now - entry.unlockedAt > PENDING_UNLOCK_MS) {
         wipeAllKeys();
         break;
+      }
+    }
+    for (const [key, entry] of pendingTotpHandoffs) {
+      if (now >= entry.expiresAt) {
+        clearTotpHandoffByKey(key);
       }
     }
   }
@@ -821,7 +999,7 @@ function formatPasskeyError(id, err) {
   return { id, ok: false, error: "NotAllowedError", message: msg };
 }
 
-async function handleAction(req) {
+async function handleAction(req, clientId = 0) {
   const { id, action } = req || {};
   try {
     switch (action) {
@@ -834,12 +1012,12 @@ async function handleAction(req) {
       }
 
       case "lock": {
-        wipeAllKeys();
+        wipeAllKeys({ clearTotp: true });
         return { id, ok: true };
       }
 
       case "shutdown": {
-        wipeAllKeys();
+        wipeAllKeys({ clearTotp: true });
         setImmediate(() => process.emit("SIGTERM"));
         return { id, ok: true };
       }
@@ -851,13 +1029,25 @@ async function handleAction(req) {
         }
         const userKey = await bridge.unlockWithTouchId(active.id);
         const metadataOnly = Boolean(req.metadataOnly);
-        const items = req.uri
-          ? queryLocalVaultForUrl(active.id, userKey, req.uri, { metadataOnly })
+        const rawItems = req.uri
+          ? queryLocalVaultForUrl(active.id, userKey, req.uri, {
+              metadataOnly,
+              includeTotpWindow: !metadataOnly,
+            })
           : [];
-        if (!metadataOnly || (req.uri && items.length === 0)) {
+        if (!metadataOnly) {
+          syncTotpHandoffForItems({
+            clientId,
+            tabId: req.tabId,
+            userId: active.id,
+            uri: req.uri,
+            items: rawItems,
+          });
+        }
+        if (!metadataOnly || (req.uri && rawItems.length === 0)) {
           wipeAllKeys();
         }
-        return { id, ok: true, email: active.email, items };
+        return { id, ok: true, email: active.email, items: stripInternalItemFields(rawItems) };
       }
 
       case "getLogins": {
@@ -882,11 +1072,75 @@ async function handleAction(req) {
           };
         }
         const metadataOnly = Boolean(req.metadataOnly);
-        const items = queryLocalVaultForUrl(active.id, userKey, req.uri, {
+        const rawItems = queryLocalVaultForUrl(active.id, userKey, req.uri, {
           metadataOnly,
           credentialIdFilter: req.credentialId || null,
+          includeTotpWindow: !metadataOnly,
         });
         if (!metadataOnly) {
+          syncTotpHandoffForItems({
+            clientId,
+            tabId: req.tabId,
+            userId: active.id,
+            uri: req.uri,
+            items: rawItems,
+          });
+          wipeAllKeys();
+        }
+        return { id, ok: true, email: active.email, items: stripInternalItemFields(rawItems) };
+      }
+
+      case "getTotp": {
+        if (req.passive && !isAutofillEligibleUrl(req.uri)) {
+          return { id, ok: true, items: [] };
+        }
+        const { active } = getStatusSnapshot();
+        const handoffItem = peekTotpHandoff(req.uri, {
+          clientId,
+          tabId: req.tabId ?? null,
+          credentialIdFilter: req.credentialId || null,
+          activeUserId: active?.id ?? null,
+        });
+        if (handoffItem) {
+          if (req.consume) {
+            clearTotpHandoff({ clientId, tabId: req.tabId ?? null });
+            wipeAllKeys();
+          }
+          return { id, ok: true, source: "handoff", items: [handoffItem] };
+        }
+        if (!active) {
+          return { id, ok: false, error: "no_account" };
+        }
+        const userKey = peekUnlockedKey(active.id);
+        if (!userKey) {
+          if (req.passive && !vaultUriCache.hasTotpMatch(active.id, req.uri)) {
+            return { id, ok: true, email: active.email, items: [] };
+          }
+          return {
+            id,
+            ok: false,
+            error: "locked",
+            userId: active.id,
+            email: active.email,
+          };
+        }
+        const metadataOnly = !req.consume;
+        const rawItems = queryLocalVaultForUrl(active.id, userKey, req.uri, {
+          metadataOnly,
+          credentialIdFilter: req.credentialId || null,
+          includeTotpWindow: !metadataOnly,
+        }).filter((item) => (metadataOnly ? item.hasTotp : Boolean(item.totp)));
+        const now = Date.now();
+        const items = rawItems.map(({ _totpWindow, _uriRules, ...item }) =>
+          _totpWindow
+            ? {
+                ...item,
+                expiresAt: _totpWindow.expiresAt,
+                remainingSeconds: remainingTotpSeconds(_totpWindow.expiresAt, now),
+              }
+            : item,
+        );
+        if (req.consume) {
           wipeAllKeys();
         }
         return { id, ok: true, email: active.email, items };
@@ -921,6 +1175,47 @@ async function handleAction(req) {
           return { id, ok: true, ...desktopInspect };
         }
         return { id, ok: true, email: active.email, decision: "unknown" };
+      }
+
+      case "stageTotpHandoff": {
+        const totpWindow = generateTotpWindow(req.otpauthUri);
+        if (!totpWindow) {
+          return { id, ok: false, error: "invalid_totp" };
+        }
+        const staged = storeTotpHandoff({
+          clientId,
+          tabId: req.tabId ?? null,
+          userId: null,
+          uri: req.uri,
+          uriRules: null,
+          credentialId: null,
+          name: req.name || "",
+          userName: req.userName || "",
+          totpWindow,
+        });
+        if (!staged) {
+          return { id, ok: false, error: "invalid_uri" };
+        }
+        const now = Date.now();
+        return {
+          id,
+          ok: true,
+          totp: totpWindow.code,
+          expiresAt: totpWindow.expiresAt,
+          remainingSeconds: remainingTotpSeconds(totpWindow.expiresAt, now),
+        };
+      }
+
+      case "clearTotpHandoff": {
+        clearTotpHandoff({ clientId, tabId: req.tabId });
+        return { id, ok: true };
+      }
+
+      case "focusDesktop": {
+        try {
+          focusOrLaunchBitwardenDesktop();
+        } catch {}
+        return { id, ok: true };
       }
 
       case "saveLogin": {
@@ -1025,14 +1320,17 @@ const IMMEDIATE_ACTIONS = new Set([
   "passkeyCancel",
 ]);
 
+let nextClientId = 1;
+
 function createAgentServer() {
   const srv = net.createServer((socket) => {
+    const clientId = nextClientId++;
     let queue = Promise.resolve();
     attachFrameReader(
       socket,
       (req) => {
         if (IMMEDIATE_ACTIONS.has(req?.action)) {
-          handleAction(req)
+          handleAction(req, clientId)
             .then((reply) => {
               if (!socket.destroyed) writeFrame(socket, reply);
             })
@@ -1041,7 +1339,7 @@ function createAgentServer() {
         }
         queue = queue
           .then(async () => {
-            const reply = await handleAction(req);
+            const reply = await handleAction(req, clientId);
             if (!socket.destroyed) {
               writeFrame(socket, reply);
             }
@@ -1050,6 +1348,7 @@ function createAgentServer() {
       },
       () => socket.destroy(),
     );
+    socket.on("close", () => clearTotpHandoff({ clientId }));
     socket.on("error", () => {});
   });
   return srv;
