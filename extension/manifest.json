@@ -59,7 +59,7 @@
         "default": "Ctrl+Shift+L",
         "mac": "Command+Shift+L"
       },
-      "description": "Autofill current page (triggers Touch ID if locked)"
+      "description": "Autofill current page (biometric unlock if locked)"
     }
   }
 }

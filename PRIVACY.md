@@ -1,28 +1,40 @@
 # Privacy Policy — Warden Air
 
-**Last updated:** 2026-11-24
+**Last updated:** 2026-11-25
 
-Warden Air is a local-first browser extension that bridges Chromium browsers with your locally installed **Bitwarden Desktop** application via a separate open-source Native Messaging Host.
+Warden Air is a local-first browser extension that works with a separate, user-installed open-source Native Messaging Host and your locally installed **Bitwarden Desktop** application.
 
-## Data Processed
+## Data Handled
 
-To provide autofill, passkey authentication, and login saving, the extension processes:
+All processing happens locally on your device for the single purpose of password, passkey, and TOTP authentication with Bitwarden Desktop:
 
-- **Active page URL / origin**: Used to match credentials and passkeys for the current site.
-- **Credentials & Passkeys**: Decrypted locally via your Bitwarden Desktop app (after Touch ID / Windows Hello verification) and filled into the active page on request. When you submit a new or changed login form, the submitted username and password are held temporarily in memory so you can choose to save or update them in Bitwarden Desktop.
-- **Clipboard**: When autofilling a login with TOTP enabled or clicking Copy, the requested value (username, password, or TOTP code) is written to the system clipboard.
-- **Site Exclusions (`chrome.storage.local`)**: Sites where you choose "Never save" are stored locally in `chrome.storage.local`.
+| Data | How it is used |
+|---|---|
+| **Page & frame URLs / origins** | Read by content scripts (`http://*/*` and `https://*/*` for inline autofill and login save detection; `https://*/*` and `http://localhost/*` for WebAuthn passkey bridging, including iframes) to match credentials and passkeys for the active site. |
+| **Vault data, credentials & passkeys** | After Touch ID / Windows Hello unlock, the local Native Messaging Host receives the unlocked `userKey`, reads Bitwarden Desktop's local `data.json`, builds an in-memory index of matching URIs, item names, and passkey metadata, and decrypts requested usernames, passwords, and TOTP secrets locally. Passkey registration/assertion and login saves are forwarded over local IPC to Bitwarden Desktop. |
+| **Submitted login forms** | When you submit a new or modified login form (or click a form submit button), the entered username and password are held in memory for up to 60 seconds so you can choose to save or update them in Bitwarden Desktop. |
+| **Visible tab screenshot & TOTP secret (QR scan)** | Only when you click **Scan TOTP QR** or **Scan Again**, the extension captures a PNG screenshot of the active tab's visible area (`chrome.tabs.captureVisibleTab`) and decodes the QR code locally in the browser (`BarcodeDetector`). The decoded `otpauth://` URI (containing the TOTP secret) is held in the scanner window to generate live verification codes, staged briefly with the local Host for autofill handoff, and automatically copied to your system clipboard so you can save it into Bitwarden Desktop. |
+| **Clipboard** | Writing a username, password, TOTP code, or scanned `otpauth://` URI to the system clipboard when you trigger Copy, TOTP autofill, or Scan TOTP QR. |
+| **Site exclusions (`chrome.storage.local`)** | Hosts where you choose **Never save** are stored locally in `chrome.storage.local`. |
+| **Native Host local state** | The Native Messaging Host stores a local application identifier and a Bitwarden Desktop IPC shared key (not your vault `userKey` or master password) in `~/.config/warden-air/session.json` (macOS) or `%LOCALAPPDATA%\warden-air\session.json` (Windows). |
 
 ## Data Sharing & Network Transmission
 
-- **No telemetry, analytics, or external servers**: The extension does not collect analytics, tracking data, or send your credentials to any server operated by the developer.
-- **Local-only communication**: All credential and passkey operations happen locally between the extension, the user-installed Native Messaging Host, and Bitwarden Desktop on your device. If you choose to save or update a login, Bitwarden Desktop handles syncing according to your own Bitwarden account configuration.
+- **No developer servers or telemetry**: Warden Air does not collect analytics, usage telemetry, or crash reports, and never sends your credentials, screenshots, or browsing history to any server operated by the developer.
+- **Website authentication & Bitwarden sync**: Decrypted credentials, TOTP codes, and passkey assertions are supplied only to the website you are authenticating with. If you save or update a login, Bitwarden Desktop handles vault syncing according to your own Bitwarden account settings.
+- **External links**: Clicking the setup documentation or issue links opens GitHub in a new tab.
+
+## Retention & Removal
+
+- **In-memory data**: The Host's `userKey` is zeroed immediately after decrypting a requested secret (or 60 seconds after unlock if not consumed / on system sleep / on manual **Lock**). Pending login saves expire after 60s; TOTP handoff codes are short-lived and cleared on manual **Lock**; the QR scanner window closes automatically after 3 minutes of inactivity (reset on interaction).
+- **Clipboard**: Values copied to your system clipboard (including scanned `otpauth://` URIs) are not automatically cleared by the extension.
+- **Persistent local data**: Removing the extension clears `chrome.storage.local`. To remove the Native Messaging Host and its local IPC shared key, follow the uninstall steps in `README.md`.
 
 ## Browser Settings
 
-Once connected to the local Native Messaging Host, Warden Air disables the browser's built-in password-saving prompt (`chrome.privacy.services.passwordSavingEnabled`) to avoid duplicate save prompts. Disabling or uninstalling the extension restores browser control of this setting.
+Once the extension receives a response from the local Native Messaging Host, it disables the browser's built-in password-saving prompt (`chrome.privacy.services.passwordSavingEnabled = false`) to avoid duplicate save prompts. Disabling or uninstalling the extension restores browser control of this setting.
 
 ## Contact
 
-For questions or issues, please open an issue at:
+For questions or privacy inquiries, please open an issue at:
 https://github.com/billxc/warden-air/issues
