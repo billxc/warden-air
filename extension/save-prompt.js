@@ -119,12 +119,6 @@ async function submitSave(extra, activeBtn, restoreLabel) {
     accountTag.textContent = res.email;
   }
 
-  if (res.status === "confirm_update" && res.candidate?.credentialId) {
-    setControlsDisabled(false);
-    renderUpdateMode(res.candidate);
-    return;
-  }
-
   const doneMsg =
     res.status === "updated"
       ? "✓ Password updated in Bitwarden"
@@ -161,9 +155,13 @@ function renderCreateMode({ host, username }) {
   queueMicrotask(() => saveBtn.focus());
 }
 
-function renderUpdateMode(candidate) {
+function renderUpdateMode(candidate, host) {
   pendingCandidate = candidate;
   brandTitle.textContent = `🔑 Update "${candidate.name}"?`;
+  if (host) {
+    hostPill.textContent = host;
+  }
+  usernameInput.value = candidate.userName ?? "";
   usernameInput.hidden = true;
   updateBox.hidden = false;
   updateTitle.textContent = `Update "${candidate.name}"?`;
@@ -189,12 +187,30 @@ function renderUpdateMode(candidate) {
   updateBtn.textContent = "Update";
   updateBtn.addEventListener("click", (e) => {
     if (!e.isTrusted) return;
-    submitSave({ updateCredentialId: candidate.credentialId }, updateBtn, "Update");
+    submitSave(
+      {
+        updateCredentialId: candidate.credentialId,
+        expectedRevisionDate: candidate.expectedRevisionDate,
+      },
+      updateBtn,
+      "Update",
+    );
   });
 
   actionSlot.append(saveNewBtn, updateBtn);
   ensureMinHeight(248);
   queueMicrotask(() => updateBtn.focus());
+}
+
+function renderPromptState({ host, username, email, candidate }) {
+  if (email) {
+    accountTag.textContent = email;
+  }
+  if (candidate?.credentialId) {
+    renderUpdateMode(candidate, host);
+  } else {
+    renderCreateMode({ host, username });
+  }
 }
 
 usernameInput.addEventListener("keydown", (e) => {
@@ -227,7 +243,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     clearTimeout(closeTimer);
     captureId = msg.captureId;
     setControlsDisabled(false);
-    renderCreateMode({ host: msg.host, username: msg.username });
+    renderPromptState(msg);
   }
 });
 
@@ -247,10 +263,7 @@ async function init() {
     return;
   }
 
-  if (state.email) {
-    accountTag.textContent = state.email;
-  }
-  renderCreateMode({ host: state.host, username: state.username });
+  renderPromptState(state);
 }
 
 init();

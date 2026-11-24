@@ -515,7 +515,7 @@ function isIndexableCipherUri(plainUri, effectiveMatchType) {
   return isAutofillEligibleUrl(hasExplicitScheme ? plainUri : `https://${plainUri}`);
 }
 
-function isEligiblePasswordCipher(cipher) {
+export function isEligiblePasswordCipher(cipher) {
   return Boolean(
     cipher &&
       cipher.deletedDate == null &&
@@ -537,6 +537,19 @@ function isEligiblePasskeyCipher(cipher) {
   );
 }
 
+export function isSafeUpdateCipherRaw(raw, defaultMatch = 0) {
+  if (!raw || raw.deletedDate != null || raw.edit === false || raw.reprompt) return false;
+  const uris = raw.login?.uris;
+  if (Array.isArray(uris)) {
+    if (uris.length > 1) return false;
+    if (uris.length === 1) {
+      const effMatch = uris[0]?.match ?? defaultMatch;
+      if (effMatch !== 0 && effMatch !== 1) return false;
+    }
+  }
+  return true;
+}
+
 export function hasAnyPasskeyInLocalStore(userId, dataFileResolver = resolveBitwardenDataFile) {
   if (!userId) return false;
   const dataFile = dataFileResolver();
@@ -553,9 +566,37 @@ export function hasAnyPasskeyInLocalStore(userId, dataFileResolver = resolveBitw
 export class VaultUriCache {
   #byUser = new Map();
   #resolveDataFile;
+  #hmacKey = crypto.randomBytes(32);
 
   constructor({ dataFileResolver = resolveBitwardenDataFile } = {}) {
     this.#resolveDataFile = dataFileResolver;
+  }
+
+  #hmac(tag, value) {
+    return crypto
+      .createHmac("sha256", this.#hmacKey)
+      .update(`${tag}:${value}`, "utf8")
+      .digest("hex");
+  }
+
+  #ensureUserState(userId) {
+    let state = this.#byUser.get(userId);
+    if (!state) {
+      state = {
+        cipherRules: new Map(),
+        loginEntries: new Map(),
+        passkeyRpIds: new Map(),
+        indexedPasskeyRevisions: new Map(),
+        hasUnindexedPasskey: false,
+        savedPasskeyRpIds: new Set(),
+        savedRules: new Map(),
+        defaultMatch: 0,
+        initialized: false,
+        lastMtimeMs: -1,
+      };
+      this.#byUser.set(userId, state);
+    }
+    return state;
   }
 
   refreshFromVault(userId, userKeyBuf) {
@@ -569,6 +610,7 @@ export class VaultUriCache {
     const orgKeys = createOrgKeyResolver(store, userId, userKeyBuf);
 
     const cipherRules = new Map();
+    const loginEntries = new Map();
     const passkeyRpIds = new Map();
     const indexedPasskeyRevisions = new Map();
 
@@ -600,14 +642,35 @@ export class VaultUriCache {
               if (!u?.uri) continue;
               try {
                 const plainUri = decryptSymString(u.uri, itemKey);
-                const match = u.match ?? defaultMatch;
-                if (isIndexableCipherUri(plainUri, match)) {
-                  rules.push({ uri: plainUri, match });
+                const rawMatch = u.match ?? null;
+                if (isIndexableCipherUri(plainUri, rawMatch ?? defaultMatch)) {
+                  rules.push({ uri: plainUri, match: rawMatch });
                 }
               } catch {}
             }
             if (rules.length > 0) {
               cipherRules.set(cipherId, rules);
+              let name = "";
+              let userHmac = null;
+              let passHmac = null;
+              try {
+                name = decryptSymString(cipher.name, itemKey) || "";
+                const userName = decryptSymString(cipher.login.username, itemKey) || "";
+                const password = decryptSymString(cipher.login.password, itemKey) || "";
+                userHmac = this.#hmac("u", userName);
+                passHmac = this.#hmac("p", password);
+              } catch {}
+              loginEntries.set(cipherId, {
+                credentialId: cipherId,
+                rules,
+                rulesFresh: true,
+                revisionDate: cipher.revisionDate || "",
+                recordedMtimeMs: mtimeMs,
+                editable: isSafeUpdateCipherRaw(cipher, defaultMatch),
+                name,
+                userHmac,
+                passHmac,
+              });
             }
           }
 
@@ -637,63 +700,96 @@ export class VaultUriCache {
 
     this.#byUser.set(userId, {
       cipherRules,
+      loginEntries,
       passkeyRpIds,
       indexedPasskeyRevisions,
       hasUnindexedPasskey: false,
       savedPasskeyRpIds: new Set(),
       savedRules: new Map(),
+      defaultMatch,
       initialized: true,
       lastMtimeMs: mtimeMs,
     });
   }
 
-  recordSavedUri(userId, rawUri) {
-    if (!userId || !isAutofillEligibleUrl(rawUri)) return;
-    let state = this.#byUser.get(userId);
-    if (!state) {
-      state = {
-        cipherRules: new Map(),
-        passkeyRpIds: new Map(),
-        savedPasskeyRpIds: new Set(),
-        savedRules: new Map(),
-        initialized: false,
-        lastMtimeMs: -1,
-      };
-      this.#byUser.set(userId, state);
-    }
+  recordSavedLogin(
+    userId,
+    {
+      credentialId = null,
+      name = "",
+      uri,
+      username = "",
+      password = "",
+      editable = true,
+      preserveExistingRules = false,
+    },
+  ) {
+    if (!userId || !uri) return;
+    const state = this.#ensureUserState(userId);
+    this.#pruneStaleCiphers(userId, state);
+
     const dataFile = this.#resolveDataFile();
-    let defaultMatch = 0;
+    let defaultMatch = state.defaultMatch;
+    let revisionDate = "";
+    let liveRawMatch = null;
+    let liveMtimeMs = -1;
     if (dataFile) {
       try {
+        liveMtimeMs = fs.statSync(dataFile).mtimeMs;
         const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
         defaultMatch = store[`user_${userId}_domainSettings_defaultUriMatchStrategy`] ?? 0;
+        if (credentialId) {
+          const raw = store[`user_${userId}_ciphers_ciphers`]?.[credentialId];
+          revisionDate = raw?.revisionDate || "";
+          if (Array.isArray(raw?.login?.uris) && raw.login.uris.length === 1) {
+            liveRawMatch = raw.login.uris[0]?.match ?? null;
+          }
+        }
       } catch {}
     }
-    state.savedRules.set(rawUri, { uri: rawUri, match: defaultMatch });
+    state.defaultMatch = defaultMatch;
+
+    const prev = credentialId ? state.loginEntries.get(credentialId) : null;
+    const reusePrevRules = Boolean(preserveExistingRules && prev?.rulesFresh);
+    const savedRule = preserveExistingRules ? { uri, match: 3 } : { uri, match: liveRawMatch };
+
+    if (isAutofillEligibleUrl(uri) && !reusePrevRules) {
+      state.savedRules.set(uri, savedRule);
+      if (!preserveExistingRules && credentialId && state.cipherRules.has(credentialId)) {
+        state.cipherRules.set(credentialId, [savedRule]);
+      }
+    }
+    if (!password) return;
+
+    const userHmac = this.#hmac("u", username);
+    const passHmac = this.#hmac("p", password);
+    const rules = reusePrevRules ? prev.rules : [savedRule];
+    const key = credentialId || `saved:${uri}\0${userHmac}`;
+
+    state.loginEntries.set(key, {
+      credentialId,
+      rules,
+      rulesFresh: !preserveExistingRules || reusePrevRules,
+      revisionDate,
+      recordedMtimeMs: liveMtimeMs,
+      editable: Boolean(editable && credentialId),
+      name: name || prev?.name || "",
+      userHmac,
+      passHmac,
+    });
   }
 
   recordSavedPasskeyRpId(userId, rpId) {
     if (!userId || !rpId) return;
-    let state = this.#byUser.get(userId);
-    if (!state) {
-      state = {
-        cipherRules: new Map(),
-        passkeyRpIds: new Map(),
-        savedPasskeyRpIds: new Set(),
-        savedRules: new Map(),
-        initialized: false,
-        lastMtimeMs: -1,
-      };
-      this.#byUser.set(userId, state);
-    }
+    const state = this.#ensureUserState(userId);
     state.savedPasskeyRpIds.add(String(rpId).toLowerCase());
   }
 
   #pruneStaleCiphers(userId, state) {
-    if (!state.initialized) return;
     const dataFile = this.#resolveDataFile();
     if (!dataFile) {
       state.cipherRules.clear();
+      state.loginEntries.clear();
       state.passkeyRpIds.clear();
       state.hasUnindexedPasskey = false;
       return;
@@ -704,37 +800,147 @@ export class VaultUriCache {
     } catch {
       return;
     }
+    if (!state.initialized && state.loginEntries.size === 0 && state.savedRules.size === 0) return;
     if (mtimeMs === state.lastMtimeMs) return;
 
     try {
       const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
       const ciphersMap = store[`user_${userId}_ciphers_ciphers`] || {};
-      for (const cipherId of state.cipherRules.keys()) {
-        if (!isEligiblePasswordCipher(ciphersMap[cipherId])) {
-          state.cipherRules.delete(cipherId);
+      const defaultMatch = store[`user_${userId}_domainSettings_defaultUriMatchStrategy`] ?? 0;
+      const defaultChanged = defaultMatch !== state.defaultMatch;
+      state.defaultMatch = defaultMatch;
+
+      for (const [key, item] of state.loginEntries.entries()) {
+        if (!item.credentialId) {
+          if (item.recordedMtimeMs !== mtimeMs) {
+            state.loginEntries.delete(key);
+          }
+          continue;
+        }
+        const raw = ciphersMap[item.credentialId];
+        if (!isEligiblePasswordCipher(raw)) {
+          state.loginEntries.delete(key);
+          state.cipherRules.delete(item.credentialId);
+          continue;
+        }
+        const liveRev = raw.revisionDate || "";
+        if (liveRev !== item.revisionDate) {
+          if (state.cipherRules.has(item.credentialId)) {
+            item.revisionDate = liveRev;
+            item.editable = isSafeUpdateCipherRaw(raw, defaultMatch);
+            item.rulesFresh = false;
+            item.userHmac = null;
+            item.passHmac = null;
+          } else {
+            state.loginEntries.delete(key);
+          }
+        } else if (defaultChanged) {
+          item.editable = isSafeUpdateCipherRaw(raw, defaultMatch);
         }
       }
-      for (const cipherId of state.passkeyRpIds.keys()) {
-        if (!isEligiblePasskeyCipher(ciphersMap[cipherId])) {
-          state.passkeyRpIds.delete(cipherId);
-          state.indexedPasskeyRevisions?.delete(cipherId);
+
+      if (state.initialized) {
+        for (const cipherId of state.passkeyRpIds.keys()) {
+          if (!isEligiblePasskeyCipher(ciphersMap[cipherId])) {
+            state.passkeyRpIds.delete(cipherId);
+            state.indexedPasskeyRevisions?.delete(cipherId);
+          }
         }
-      }
-      let unindexed = false;
-      for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
-        if (!isEligiblePasskeyCipher(cipher)) continue;
-        if (state.indexedPasskeyRevisions?.get(cipherId) !== (cipher.revisionDate || "")) {
-          unindexed = true;
-          break;
+        let unindexed = false;
+        for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
+          if (!isEligiblePasskeyCipher(cipher)) continue;
+          if (state.indexedPasskeyRevisions?.get(cipherId) !== (cipher.revisionDate || "")) {
+            unindexed = true;
+            break;
+          }
         }
+        state.hasUnindexedPasskey = unindexed;
       }
-      state.hasUnindexedPasskey = unindexed;
+
       state.lastMtimeMs = mtimeMs;
     } catch {}
   }
 
   isInitialized(userId) {
     return Boolean(this.#byUser.get(userId)?.initialized);
+  }
+
+  inspectSaveCandidate(userId, targetUri, username = "", password = "") {
+    if (!userId || !password) return { decision: "unknown" };
+    let targetUrl;
+    try {
+      targetUrl = new URL(targetUri);
+    } catch {
+      return { decision: "unknown" };
+    }
+    if (!/^https?:$/i.test(targetUrl.protocol)) {
+      return { decision: "unknown" };
+    }
+
+    const state = this.#byUser.get(userId);
+    if (!state) return { decision: "unknown" };
+
+    this.#pruneStaleCiphers(userId, state);
+
+    const matches = [];
+    for (const item of state.loginEntries.values()) {
+      let bestScore = 0;
+      for (const rule of item.rules) {
+        const s = matchUriScore(targetUrl, rule.uri, rule.match ?? state.defaultMatch);
+        if (s > bestScore) bestScore = s;
+      }
+      if (bestScore > 0) {
+        matches.push({ ...item, _score: bestScore });
+      }
+    }
+
+    if (matches.length === 0) {
+      return { decision: state.initialized ? "create" : "unknown" };
+    }
+
+    matches.sort((a, b) => b._score - a._score);
+
+    const targetUserHmac = this.#hmac("u", username);
+    const targetPassHmac = this.#hmac("p", password);
+
+    if (matches.some((m) => m.userHmac === targetUserHmac && m.passHmac === targetPassHmac)) {
+      return { decision: "unchanged" };
+    }
+    if (username === "" && matches.length === 1 && matches[0].passHmac === targetPassHmac) {
+      return { decision: "unchanged" };
+    }
+
+    let candidate = matches.find(
+      (m) => m.editable && m.credentialId && m.userHmac === targetUserHmac,
+    );
+    if (
+      !candidate &&
+      username === "" &&
+      matches.length === 1 &&
+      matches[0].editable &&
+      matches[0].credentialId &&
+      matches[0].passHmac != null
+    ) {
+      candidate = matches[0];
+    }
+
+    if (candidate) {
+      return {
+        decision: "update",
+        candidate: {
+          credentialId: candidate.credentialId,
+          name: candidate.name || targetUrl.host,
+          userName: username,
+          expectedRevisionDate: candidate.revisionDate ?? "",
+        },
+      };
+    }
+
+    if (matches.some((m) => m.userHmac == null || m.passHmac == null)) {
+      return { decision: "unknown" };
+    }
+
+    return { decision: state.initialized ? "create" : "unknown" };
   }
 
   hasPasskeyRpId(userId, rpId) {
@@ -772,13 +978,13 @@ export class VaultUriCache {
     const targetUrl = new URL(targetUri);
     for (const rules of state.cipherRules.values()) {
       for (const rule of rules) {
-        if (matchUriScore(targetUrl, rule.uri, rule.match) > 0) {
+        if (matchUriScore(targetUrl, rule.uri, rule.match ?? state.defaultMatch) > 0) {
           return true;
         }
       }
     }
     for (const rule of state.savedRules.values()) {
-      if (matchUriScore(targetUrl, rule.uri, rule.match) > 0) {
+      if (matchUriScore(targetUrl, rule.uri, rule.match ?? state.defaultMatch) > 0) {
         return true;
       }
     }

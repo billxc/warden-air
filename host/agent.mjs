@@ -28,6 +28,8 @@ import {
   encryptSymEncString,
   hasAnyPasskeyInLocalStore,
   isAutofillEligibleUrl,
+  isEligiblePasswordCipher,
+  isSafeUpdateCipherRaw,
   queryLocalVaultForUrl,
   readAccountsFromLocalStore,
   resolveBitwardenDataFile,
@@ -369,8 +371,10 @@ class DesktopBiometricBridge {
     }
   }
 
-  async sendVersionedMessage(body, timeoutMs = 12_000) {
-    const proc = await this.ensureConnectedLaunchingDesktop();
+  async sendVersionedMessage(body, timeoutMs = 12_000, { launchDesktop = true } = {}) {
+    const proc = launchDesktop
+      ? await this.ensureConnectedLaunchingDesktop()
+      : await this.ensureConnected();
     const messageId = crypto.randomUUID();
     return await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -477,6 +481,73 @@ class DesktopBiometricBridge {
     throw new Error("desktop_cannot_decrypt");
   }
 
+  async sendPassiveDesktopCommand(command, payload, timeoutMs = 800) {
+    const cachedB64 = getStoredDesktopSharedKey();
+    if (!cachedB64) return null;
+    const sharedKey = Buffer.from(cachedB64, "base64");
+    try {
+      const plainCmd = JSON.stringify(payload !== undefined ? { command, payload } : { command });
+      const encryptedCommand = encryptSymEncString(plainCmd, sharedKey).encryptedString;
+      const reply = await this.sendVersionedMessage({ encryptedCommand }, timeoutMs, {
+        launchDesktop: false,
+      });
+      if (!reply?.encryptedPayload) return null;
+      const inner = JSON.parse(decryptSymString(reply.encryptedPayload, sharedKey));
+      return inner?.payload ?? null;
+    } catch {
+      return null;
+    } finally {
+      sharedKey.fill(0);
+    }
+  }
+
+  async inspectSaveViaUnlockedDesktop({ uri, username = "", password = "" }) {
+    if (!password) return null;
+    let targetUrl;
+    try {
+      targetUrl = new URL(uri);
+    } catch {
+      return null;
+    }
+    if (!/^https?:$/i.test(targetUrl.protocol)) return null;
+
+    const accounts = await this.sendPassiveDesktopCommand("bw-status");
+    const active = Array.isArray(accounts) ? accounts.find((a) => a.active) || accounts[0] : null;
+    if (!active || active.status !== "unlocked") return null;
+
+    const existing = await this.sendPassiveDesktopCommand("bw-credential-retrieval", {
+      uri: targetUrl.href,
+    });
+    if (!Array.isArray(existing)) return null;
+
+    const { ciphersMap, defaultMatch } = readLocalCipherMeta(active.id);
+    const { exactDup, candidate } = matchExistingDesktopCredential(
+      existing,
+      username,
+      password,
+      ciphersMap,
+      defaultMatch,
+      { allowPasswordOnlySingleMatch: true },
+    );
+
+    if (exactDup) {
+      return { email: active.email, decision: "unchanged" };
+    }
+    if (candidate) {
+      return {
+        email: active.email,
+        decision: "update",
+        candidate: {
+          credentialId: candidate.credentialId,
+          name: candidate.name || targetUrl.host,
+          userName: username || (candidate.userName ?? ""),
+          expectedRevisionDate: ciphersMap[candidate.credentialId]?.revisionDate ?? "",
+        },
+      };
+    }
+    return { email: active.email, decision: "create" };
+  }
+
   saveLoginViaDesktop(params) {
     const run = this.ddgQueue.then(() => this.#saveLoginViaDesktopImpl(params));
     this.ddgQueue = run.catch(() => {});
@@ -488,6 +559,7 @@ class DesktopBiometricBridge {
     username = "",
     password = "",
     updateCredentialId = null,
+    expectedRevisionDate = null,
     forceCreate = false,
   }) {
     let targetUrl;
@@ -506,7 +578,9 @@ class DesktopBiometricBridge {
       throw new Error("no_account");
     }
 
+    let focusedDesktop = false;
     if (active.status !== "unlocked") {
+      focusedDesktop = true;
       focusOrLaunchBitwardenDesktop();
       const unlockDeadline = Date.now() + Number(process.env.BW_UNLOCK_WAIT_MS || 45_000);
       while (Date.now() < unlockDeadline) {
@@ -529,35 +603,60 @@ class DesktopBiometricBridge {
       throw new Error(`desktop_${existing.error}`);
     }
     const list = Array.isArray(existing) ? existing : [];
-
-    const exactDup = list.find(
-      (c) => (c.userName ?? "") === username && (c.password ?? "") === password,
+    const { ciphersMap, defaultMatch } = readLocalCipherMeta(active.id);
+    const { exactDup, candidate } = matchExistingDesktopCredential(
+      list,
+      username,
+      password,
+      ciphersMap,
+      defaultMatch,
+      { allowPasswordOnlySingleMatch: false },
     );
+
     if (exactDup) {
-      vaultUriCache.recordSavedUri(active.id, canonicalUri);
-      return { status: "unchanged", credentialId: exactDup.credentialId, email: active.email };
+      vaultUriCache.recordSavedLogin(active.id, {
+        credentialId: exactDup.credentialId,
+        name: exactDup.name || targetUrl.host,
+        uri: targetUrl.href,
+        username: exactDup.userName ?? username,
+        password,
+        editable: isSafeDesktopUpdateTarget(exactDup, ciphersMap, defaultMatch),
+        preserveExistingRules: true,
+      });
+      return {
+        status: "unchanged",
+        credentialId: exactDup.credentialId,
+        email: active.email,
+        focusedDesktop,
+      };
     }
 
-    const { ciphersMap, defaultMatch } = readLocalCipherMeta(active.id);
-
+    let chosen = forceCreate ? null : candidate;
     if (updateCredentialId) {
-      const chosen = list.find(
+      chosen = list.find(
         (c) =>
           c.credentialId === updateCredentialId &&
-          (c.userName ?? "") === username &&
-          isSafeDesktopUpdateTarget(c, ciphersMap, defaultMatch),
+          isSafeDesktopUpdateTarget(c, ciphersMap, defaultMatch) &&
+          (expectedRevisionDate == null ||
+            (ciphersMap[c.credentialId]?.revisionDate ?? "") === expectedRevisionDate) &&
+          ((c.userName ?? "") === username || (username === "" && expectedRevisionDate != null)),
       );
       if (!chosen) {
         throw new Error("update_target_unavailable");
       }
+    }
+
+    if (chosen) {
       const updatedUri = `${targetUrl.origin}/`;
+      const nextUserName = username || (chosen.userName ?? "");
+      const itemName = chosen.name || targetUrl.host;
       const res = await this.sendDesktopCommand(
         "bw-credential-update",
         {
           userId: active.id,
           credentialId: chosen.credentialId,
-          name: chosen.name || targetUrl.host,
-          userName: username,
+          name: itemName,
+          userName: nextUserName,
           password,
           uri: updatedUri,
         },
@@ -566,33 +665,23 @@ class DesktopBiometricBridge {
       if (res?.status !== "success") {
         throw new Error(res?.error || "desktop_update_failed");
       }
-      vaultUriCache.recordSavedUri(active.id, updatedUri);
+      vaultUriCache.recordSavedLogin(active.id, {
+        credentialId: chosen.credentialId,
+        name: itemName,
+        uri: updatedUri,
+        username: nextUserName,
+        password,
+        editable: true,
+      });
       return {
         status: "updated",
         credentialId: chosen.credentialId,
         email: active.email,
+        focusedDesktop,
       };
     }
 
-    if (!forceCreate) {
-      const candidate = list.find(
-        (c) =>
-          (c.userName ?? "") === username &&
-          isSafeDesktopUpdateTarget(c, ciphersMap, defaultMatch),
-      );
-      if (candidate) {
-        return {
-          status: "confirm_update",
-          candidate: {
-            credentialId: candidate.credentialId,
-            name: candidate.name || "(Untitled)",
-            userName: candidate.userName ?? "",
-          },
-          email: active.email,
-        };
-      }
-    }
-
+    const beforeCipherIds = new Set(Object.keys(ciphersMap));
     const res = await this.sendDesktopCommand(
       "bw-credential-create",
       {
@@ -607,8 +696,20 @@ class DesktopBiometricBridge {
     if (res?.status !== "success") {
       throw new Error(res?.error || "desktop_create_failed");
     }
-    vaultUriCache.recordSavedUri(active.id, canonicalUri);
-    return { status: "created", email: active.email };
+    const { ciphersMap: afterCiphersMap } = readLocalCipherMeta(active.id);
+    const addedIds = Object.keys(afterCiphersMap).filter(
+      (cid) => !beforeCipherIds.has(cid) && isEligiblePasswordCipher(afterCiphersMap[cid]),
+    );
+    const createdId = res?.credentialId || (addedIds.length === 1 ? addedIds[0] : null);
+    vaultUriCache.recordSavedLogin(active.id, {
+      credentialId: createdId,
+      name: targetUrl.host,
+      uri: canonicalUri,
+      username,
+      password,
+      editable: Boolean(createdId),
+    });
+    return { status: "created", credentialId: createdId, email: active.email, focusedDesktop };
   }
 }
 
@@ -627,18 +728,45 @@ function readLocalCipherMeta(userId) {
 }
 
 function isSafeDesktopUpdateTarget(cipher, ciphersMap, defaultMatch) {
-  const raw = ciphersMap[cipher?.credentialId];
-  if (!raw) return false;
-  if (raw.deletedDate != null || raw.edit === false || raw.reprompt) return false;
-  const uris = raw.login?.uris;
-  if (Array.isArray(uris)) {
-    if (uris.length > 1) return false;
-    if (uris.length === 1) {
-      const effMatch = uris[0]?.match ?? defaultMatch;
-      if (effMatch !== 0 && effMatch !== 1) return false;
-    }
+  return isSafeUpdateCipherRaw(ciphersMap[cipher?.credentialId], defaultMatch);
+}
+
+function matchExistingDesktopCredential(
+  list,
+  username,
+  password,
+  ciphersMap,
+  defaultMatch,
+  { allowPasswordOnlySingleMatch = false } = {},
+) {
+  let exactDup = list.find(
+    (c) => (c.userName ?? "") === username && (c.password ?? "") === password,
+  );
+  if (
+    !exactDup &&
+    allowPasswordOnlySingleMatch &&
+    username === "" &&
+    list.length === 1 &&
+    (list[0].password ?? "") === password
+  ) {
+    exactDup = list[0];
   }
-  return true;
+
+  let candidate = list.find(
+    (c) =>
+      (c.userName ?? "") === username && isSafeDesktopUpdateTarget(c, ciphersMap, defaultMatch),
+  );
+  if (
+    !candidate &&
+    allowPasswordOnlySingleMatch &&
+    username === "" &&
+    list.length === 1 &&
+    isSafeDesktopUpdateTarget(list[0], ciphersMap, defaultMatch)
+  ) {
+    candidate = list[0];
+  }
+
+  return { exactDup: exactDup || null, candidate: candidate || null };
 }
 
 const bridge = new DesktopBiometricBridge();
@@ -738,12 +866,48 @@ async function handleAction(req) {
         return { id, ok: true, email: active.email, items };
       }
 
+      case "prepareSave": {
+        const { active } = getStatusSnapshot();
+        if (!active) {
+          return { id, ok: true, decision: "unknown" };
+        }
+        const liveKey = peekUnlockedKey(active.id);
+        if (liveKey && !vaultUriCache.isInitialized(active.id)) {
+          try {
+            vaultUriCache.refreshFromVault(active.id, liveKey);
+          } catch {}
+        }
+        const cached = vaultUriCache.inspectSaveCandidate(
+          active.id,
+          req.uri,
+          req.username || "",
+          req.password || "",
+        );
+        if (cached.decision !== "unknown") {
+          return { id, ok: true, email: active.email, ...cached };
+        }
+        const desktopInspect = await bridge.inspectSaveViaUnlockedDesktop({
+          uri: req.uri,
+          username: req.username || "",
+          password: req.password || "",
+        });
+        if (desktopInspect) {
+          return { id, ok: true, ...desktopInspect };
+        }
+        return { id, ok: true, email: active.email, decision: "unknown" };
+      }
+
       case "saveLogin": {
         const result = await bridge.saveLoginViaDesktop({
           uri: req.uri,
           username: req.username || "",
           password: req.password || "",
-          updateCredentialId: req.updateCredentialId || null,
+          updateCredentialId:
+            typeof req.updateCredentialId === "string" && req.updateCredentialId
+              ? req.updateCredentialId
+              : null,
+          expectedRevisionDate:
+            typeof req.expectedRevisionDate === "string" ? req.expectedRevisionDate : null,
           forceCreate: Boolean(req.forceCreate),
         });
         return { id, ok: true, ...result };
@@ -828,6 +992,8 @@ const IMMEDIATE_ACTIONS = new Set([
   "status",
   "lock",
   "shutdown",
+  "prepareSave",
+  "saveLogin",
   "passkeyAssert",
   "passkeyRegister",
   "passkeyCancel",

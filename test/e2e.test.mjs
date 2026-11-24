@@ -43,6 +43,7 @@ test("end-to-end host, single-instance agent, biometric unlock, and vault matchi
           type: 1,
           deletedDate: null,
           reprompt: 0,
+          revisionDate: "2026-01-01T00:00:00.000Z",
           name: enc("Example Portal"),
           login: {
             username: enc("alice"),
@@ -82,6 +83,7 @@ test("end-to-end host, single-instance agent, biometric unlock, and vault matchi
           type: 1,
           deletedDate: null,
           reprompt: 0,
+          revisionDate: "2026-01-01T00:00:00.000Z",
           name: enc("Victim Pages"),
           login: {
             username: enc("ghuser"),
@@ -224,6 +226,7 @@ process.stdin.on("data", (c) => {
           type: 1,
           deletedDate: null,
           reprompt: 0,
+          revisionDate: \`2026-11-24T00:00:\${String(createdSeq).padStart(2, "0")}.000Z\`,
           name: e(inner.payload.name),
           login: {
             username: inner.payload.userName ? e(inner.payload.userName) : null,
@@ -245,6 +248,7 @@ process.stdin.on("data", (c) => {
           target.login.username = inner.payload.userName ? e(inner.payload.userName) : null;
           target.login.password = e(inner.payload.password);
           target.login.uris[0].uri = e(inner.payload.uri);
+          target.revisionDate = new Date().toISOString();
           fs.writeFileSync(DATA_FILE, JSON.stringify(store));
           payload = { status: "success" };
         }
@@ -534,8 +538,49 @@ process.stdin.on("data", (c) => {
   assert.equal(passiveAfterLockMiss.ok, true);
   assert.equal(passiveAfterLockMiss.items.length, 0);
 
-  // 7. Password save via Bitwarden Desktop IPC: concurrent cold handshake + foreground unlock wait + strict update rules
+  // 7. Pre-prompt inspection while locked (HMAC cache, zero plaintext): unchanged skipped, update detected upfront
   assert.equal(fs.existsSync(desktopStateFile), false);
+  const [prepUnchanged, prepUpdate, prepPasswordOnlyUpdate, prepReadonlyOrg] = await Promise.all([
+    callHost({
+      id: 190,
+      action: "prepareSave",
+      uri: "https://example.com/login",
+      username: "alice",
+      password: "s3cr3t!",
+    }),
+    callHost({
+      id: 191,
+      action: "prepareSave",
+      uri: "https://shop.example.com/register",
+      username: "alice",
+      password: "shopOnlyPass!2",
+    }),
+    callHost({
+      id: 192,
+      action: "prepareSave",
+      uri: "https://victim.github.io/settings/password",
+      username: "",
+      password: "newGhPass!9",
+    }),
+    callHost({
+      id: 193,
+      action: "prepareSave",
+      uri: "https://corp.example.net/password",
+      username: "ops",
+      password: "personalOverride!1",
+    }),
+  ]);
+  assert.equal(prepUnchanged.decision, "unchanged");
+  assert.equal(prepUpdate.decision, "update");
+  assert.equal(prepUpdate.candidate.credentialId, "c-portal");
+  assert.equal(prepUpdate.candidate.name, "Example Portal");
+  assert.equal(prepPasswordOnlyUpdate.decision, "update");
+  assert.equal(prepPasswordOnlyUpdate.candidate.credentialId, "c-ghio");
+  assert.equal(prepReadonlyOrg.decision, "create");
+  // Pre-check must never launch or focus Bitwarden Desktop
+  assert.equal(fs.existsSync(desktopStateFile), false);
+
+  // 7b. Password save via Bitwarden Desktop IPC: concurrent cold handshake + foreground unlock wait + one-shot update
   const [createRes, roCreateRes] = await Promise.all([
     callHost({
       id: 20,
@@ -557,9 +602,10 @@ process.stdin.on("data", (c) => {
   assert.equal(createRes.status, "created");
   assert.equal(roCreateRes.ok, true);
   assert.equal(roCreateRes.status, "created");
+  assert.equal(createRes.focusedDesktop !== roCreateRes.focusedDesktop, true);
   assert.equal(fs.existsSync(desktopStateFile), true);
 
-  // Newly saved HTTPS site is immediately recognized by passive query while still locked (before Touch ID unlock)
+  // Newly saved HTTPS site is immediately recognized by passive query & prepareSave while still locked
   const passiveNewlySaved = await callHost({
     id: 21,
     action: "getLogins",
@@ -569,6 +615,15 @@ process.stdin.on("data", (c) => {
   });
   assert.equal(passiveNewlySaved.ok, false);
   assert.equal(passiveNewlySaved.error, "locked");
+
+  const prepNewlySavedDup = await callHost({
+    id: 210,
+    action: "prepareSave",
+    uri: "https://newsite.example.org/login",
+    username: "charlie",
+    password: "initPass!9",
+  });
+  assert.equal(prepNewlySavedDup.decision, "unchanged");
 
   const createdFill = await callHost({
     id: 22,
@@ -580,7 +635,7 @@ process.stdin.on("data", (c) => {
   assert.equal(createdFill.items[0].userName, "charlie");
   assert.equal(createdFill.items[0].password, "initPass!9");
 
-  // Exact duplicate is a no-op
+  // Exact duplicate is a no-op (and does not refocus Desktop when already unlocked)
   const dupRes = await callHost({
     id: 23,
     action: "saveLogin",
@@ -590,6 +645,7 @@ process.stdin.on("data", (c) => {
   });
   assert.equal(dupRes.ok, true);
   assert.equal(dupRes.status, "unchanged");
+  assert.equal(dupRes.focusedDesktop, false);
 
   // Case-different username ("CHARLIE") creates a distinct login instead of overwriting "charlie"
   const caseRes = await callHost({
@@ -601,19 +657,6 @@ process.stdin.on("data", (c) => {
   });
   assert.equal(caseRes.ok, true);
   assert.equal(caseRes.status, "created");
-
-  // Existing same-username match returns confirm_update with the item's display name instead of silently overwriting
-  const promptRes = await callHost({
-    id: 232,
-    action: "saveLogin",
-    uri: "https://shop.example.com/register",
-    username: "alice",
-    password: "shopOnlyPass!2",
-  });
-  assert.equal(promptRes.ok, true);
-  assert.equal(promptRes.status, "confirm_update");
-  assert.equal(promptRes.candidate.credentialId, "c-portal");
-  assert.equal(promptRes.candidate.name, "Example Portal");
 
   // User choosing "Save new" (forceCreate) creates a separate login without touching "c-portal"
   const forceCreateRes = await callHost({
@@ -627,18 +670,30 @@ process.stdin.on("data", (c) => {
   assert.equal(forceCreateRes.ok, true);
   assert.equal(forceCreateRes.status, "created");
 
-  // User choosing explicit "Update" (updateCredentialId) updates that exact item and preserves TOTP
+  // Cold-start / direct "Save" on an existing same-username match updates immediately in one step and preserves TOTP
   const updateRes = await callHost({
     id: 24,
     action: "saveLogin",
     uri: "https://example.com/account/password",
     username: "alice",
     password: "rotated!2026",
-    updateCredentialId: "c-portal",
   });
   assert.equal(updateRes.ok, true);
   assert.equal(updateRes.status, "updated");
   assert.equal(updateRes.credentialId, "c-portal");
+
+  // Stale expectedRevisionDate rejects explicit password-only update (even if live username is blanked)
+  const staleRevRes = await callHost({
+    id: 245,
+    action: "saveLogin",
+    uri: "https://example.com/account/password",
+    username: "",
+    password: "hijackAttempt!1",
+    updateCredentialId: "c-portal",
+    expectedRevisionDate: "2026-01-01T00:00:00.000Z",
+  });
+  assert.equal(staleRevRes.ok, false);
+  assert.equal(staleRevRes.error, "update_target_unavailable");
 
   const updatedFill = await callHost({
     id: 25,

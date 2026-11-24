@@ -367,6 +367,26 @@ async function openOrFocusSavePromptWindow(tabId, senderWindowId) {
     entry.retryTimer = null;
   }
 
+  if (entry.prepState !== "done") {
+    if (entry.prepState === "pending") return;
+    entry.prepState = "pending";
+    const prep = await callHost("prepareSave", {
+      uri: entry.uri,
+      username: entry.username,
+      password: entry.password,
+    });
+    if (getFreshPendingSave(tabId) !== entry || !entry.password) return;
+    entry.prepState = "done";
+    if (prep?.ok) {
+      if (prep.decision === "unchanged") {
+        clearPendingSave(tabId);
+        return;
+      }
+      entry.email = prep.email || "";
+      entry.candidate = prep.decision === "update" ? prep.candidate || null : null;
+    }
+  }
+
   if (entry.windowId != null) {
     try {
       await chrome.windows.get(entry.windowId);
@@ -378,6 +398,8 @@ async function openOrFocusSavePromptWindow(tabId, senderWindowId) {
           captureId: entry.captureId,
           host: entry.host,
           username: entry.username,
+          email: entry.email || "",
+          candidate: entry.candidate || null,
         })
         .catch(() => {});
       await chrome.windows.update(entry.windowId, { focused: true }).catch(() => {});
@@ -399,7 +421,7 @@ async function openOrFocusSavePromptWindow(tabId, senderWindowId) {
       senderWindowId ?? entry.senderWindowId,
       url,
       POPOUT_WINDOW_WIDTH,
-      235,
+      entry.candidate ? 250 : 235,
     );
     const cur = pendingSaves.get(tabId);
     if (!cur || cur.captureId !== targetCaptureId) {
@@ -758,14 +780,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!entry || !entry.password || entry.captureId !== msg.captureId) {
           return { ok: false, error: "expired" };
         }
-        const statusRes = await callHost("status").catch(() => null);
-        const activeAcc =
-          statusRes?.accounts?.find((a) => a.active) || statusRes?.accounts?.[0] || null;
+        let email = entry.email || "";
+        if (!email) {
+          const statusRes = await callHost("status").catch(() => null);
+          const activeAcc =
+            statusRes?.accounts?.find((a) => a.active) || statusRes?.accounts?.[0] || null;
+          email = activeAcc?.email || "";
+        }
         return {
           ok: true,
           host: entry.host,
           username: entry.username,
-          email: activeAcc?.email || "",
+          email,
+          candidate: entry.candidate || null,
         };
       }
 
@@ -781,24 +808,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!msg.captureId || msg.captureId !== entry.captureId) {
           return { ok: false, error: "stale_capture" };
         }
+        const originWindowId = entry.senderWindowId;
+        const promptWindowId = entry.windowId;
+        entry.updatedAt = Date.now();
+        clearTimeout(entry.expiryTimer);
+        entry.expiryTimer = setTimeout(() => clearPendingSave(tabId), PENDING_SAVE_TTL_MS);
         const finalUsername =
           typeof msg.username === "string" ? msg.username.trim() : entry.username;
         const res = await callHost("saveLogin", {
           uri: entry.uri,
           username: finalUsername,
           password: entry.password,
-          updateCredentialId:
-            typeof msg.updateCredentialId === "string" ? msg.updateCredentialId : null,
+          updateCredentialId: msg.updateCredentialId,
+          expectedRevisionDate: msg.expectedRevisionDate,
           forceCreate: Boolean(msg.forceCreate),
         });
-        if (res?.ok && pendingSaves.get(tabId)?.captureId === entry.captureId) {
-          if (res.status === "confirm_update") {
-            entry.updatedAt = Date.now();
-            clearTimeout(entry.expiryTimer);
-            entry.expiryTimer = setTimeout(() => clearPendingSave(tabId), PENDING_SAVE_TTL_MS);
-          } else {
+        if (res?.ok) {
+          if (pendingSaves.get(tabId)?.captureId === entry.captureId) {
             clearPendingSave(tabId, { closeWindow: false });
           }
+          if (res.focusedDesktop) {
+            if (originWindowId != null) {
+              await chrome.windows.update(originWindowId, { focused: true }).catch(() => {});
+            }
+            if (promptWindowId != null) {
+              await chrome.windows.update(promptWindowId, { focused: true }).catch(() => {});
+            }
+          }
+        } else if (promptWindowId != null) {
+          await chrome.windows.update(promptWindowId, { focused: true }).catch(() => {});
         }
         return res;
       }
