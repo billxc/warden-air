@@ -21,11 +21,13 @@
   const hasNativeWebAuthn =
     globalThis.PublicKeyCredential !== undefined &&
     navigator.credentials != null &&
-    typeof navigator.credentials.get === "function";
+    typeof navigator.credentials.get === "function" &&
+    typeof navigator.credentials.create === "function";
 
   if (!hasNativeWebAuthn) return;
 
   const nativeGet = navigator.credentials.get.bind(navigator.credentials);
+  const nativeCreate = navigator.credentials.create.bind(navigator.credentials);
 
   function toUint8Array(bufferSource) {
     if (bufferSource instanceof ArrayBuffer) {
@@ -80,6 +82,35 @@
     };
   }
 
+  function serializeCreationOptions(options, fallbackSupported) {
+    const pk = options.publicKey;
+    if (!pk.user || pk.user.id == null) {
+      throw new TypeError("Missing publicKey.user.id");
+    }
+    return {
+      rpId: pk.rp?.id,
+      rpName: pk.rp?.name || "",
+      userId: bytesToB64Url(pk.user.id),
+      userName: String(pk.user.name || ""),
+      userDisplayName: String(pk.user.displayName || pk.user.name || ""),
+      challenge: bytesToB64Url(pk.challenge),
+      pubKeyCredParams: Array.isArray(pk.pubKeyCredParams)
+        ? pk.pubKeyCredParams.map((p) => ({ type: p.type, alg: p.alg }))
+        : [],
+      excludeCredentials: Array.isArray(pk.excludeCredentials)
+        ? pk.excludeCredentials.map((c) => ({
+            id: bytesToB64Url(c.id),
+            type: c.type,
+            transports: Array.isArray(c.transports) ? [...c.transports] : [],
+          }))
+        : [],
+      authenticatorAttachment: pk.authenticatorSelection?.authenticatorAttachment,
+      userVerification: pk.authenticatorSelection?.userVerification,
+      timeout: pk.timeout,
+      fallbackSupported,
+    };
+  }
+
   function buildPublicKeyAssertion(res) {
     const rawId = b64UrlToArrayBuffer(res.credentialId);
     const clientDataJSON = b64UrlToArrayBuffer(res.clientDataJSON);
@@ -122,6 +153,71 @@
 
     if (globalThis.AuthenticatorAssertionResponse?.prototype) {
       Object.setPrototypeOf(response, globalThis.AuthenticatorAssertionResponse.prototype);
+    }
+    if (globalThis.PublicKeyCredential?.prototype) {
+      Object.setPrototypeOf(credential, globalThis.PublicKeyCredential.prototype);
+    }
+    return credential;
+  }
+
+  function buildPublicKeyRegistration(res) {
+    const rawId = b64UrlToArrayBuffer(res.credentialId);
+    const clientDataJSON = b64UrlToArrayBuffer(res.clientDataJSON);
+    const attestationObject = b64UrlToArrayBuffer(res.attestationObject);
+    const authDataBuf = res.authenticatorData
+      ? b64UrlToArrayBuffer(res.authenticatorData)
+      : new ArrayBuffer(0);
+    const pubKeyBuf = res.publicKey ? b64UrlToArrayBuffer(res.publicKey) : null;
+    const pubKeyAlg = typeof res.publicKeyAlgorithm === "number" ? res.publicKeyAlgorithm : -7;
+    const transports = Array.isArray(res.transports) ? [...res.transports] : ["internal", "hybrid"];
+
+    const response = {
+      clientDataJSON,
+      attestationObject,
+      getTransports() {
+        return [...transports];
+      },
+      getAuthenticatorData() {
+        return authDataBuf;
+      },
+      getPublicKey() {
+        return pubKeyBuf;
+      },
+      getPublicKeyAlgorithm() {
+        return pubKeyAlg;
+      },
+    };
+
+    const credential = {
+      id: res.credentialId,
+      rawId,
+      type: "public-key",
+      authenticatorAttachment: "platform",
+      response,
+      getClientExtensionResults() {
+        return {};
+      },
+      toJSON() {
+        return {
+          id: res.credentialId,
+          rawId: res.credentialId,
+          type: "public-key",
+          authenticatorAttachment: "platform",
+          clientExtensionResults: {},
+          response: {
+            clientDataJSON: res.clientDataJSON,
+            attestationObject: res.attestationObject,
+            authenticatorData: res.authenticatorData || undefined,
+            publicKey: res.publicKey || undefined,
+            publicKeyAlgorithm: pubKeyAlg,
+            transports: [...transports],
+          },
+        };
+      },
+    };
+
+    if (globalThis.AuthenticatorAttestationResponse?.prototype) {
+      Object.setPrototypeOf(response, globalThis.AuthenticatorAttestationResponse.prototype);
     }
     if (globalThis.PublicKeyCredential?.prototype) {
       Object.setPrototypeOf(credential, globalThis.PublicKeyCredential.prototype);
@@ -218,58 +314,17 @@
     });
   }
 
-  // Only intercept navigator.credentials.get (navigator.credentials.create passes straight through to the browser)
   navigator.credentials.get = async function getCredential(options) {
     if (!options || !("publicKey" in options) || !options.publicKey) {
       return await nativeGet(options);
     }
 
-    const fallbackSupported = hasNativeWebAuthn;
-
+    // Do not pop modal Desktop/Touch ID prompts passively on page load for autofill conditional UI
     if (options.mediation === "conditional") {
-      const extAbort = new AbortController();
-      const nativeAbort = new AbortController();
-      const onCallerAbort = () => {
-        extAbort.abort();
-        nativeAbort.abort();
-      };
-      options.signal?.addEventListener("abort", onCallerAbort);
-
-      let pendingBranches = 2;
-      let lastError = null;
-
-      return await new Promise((resolve, reject) => {
-        let done = false;
-        const win = (cred, otherAbort) => {
-          if (done) return;
-          done = true;
-          options.signal?.removeEventListener("abort", onCallerAbort);
-          otherAbort.abort();
-          resolve(cred);
-        };
-        const lose = (err) => {
-          lastError = err;
-          pendingBranches -= 1;
-          if (!done && pendingBranches <= 0) {
-            done = true;
-            options.signal?.removeEventListener("abort", onCallerAbort);
-            reject(rehydrateError(lastError));
-          }
-        };
-
-        sendBridgeRequest(
-          "get",
-          serializeRequestOptions(options, fallbackSupported),
-          extAbort.signal,
-        )
-          .then((res) => win(buildPublicKeyAssertion(res), nativeAbort))
-          .catch(lose);
-
-        nativeGet({ ...options, signal: nativeAbort.signal })
-          .then((cred) => win(cred, extAbort))
-          .catch(lose);
-      });
+      return await nativeGet(options);
     }
+
+    const fallbackSupported = hasNativeWebAuthn;
 
     try {
       const serialized = serializeRequestOptions(options, fallbackSupported);
@@ -279,6 +334,26 @@
       if (fallbackSupported && err && typeof err === "object" && err.fallbackRequested) {
         await waitForWindowFocus();
         return await nativeGet(options);
+      }
+      throw rehydrateError(err);
+    }
+  };
+
+  navigator.credentials.create = async function createCredential(options) {
+    if (!options || !("publicKey" in options) || !options.publicKey) {
+      return await nativeCreate(options);
+    }
+
+    const fallbackSupported = hasNativeWebAuthn;
+
+    try {
+      const serialized = serializeCreationOptions(options, fallbackSupported);
+      const res = await sendBridgeRequest("create", serialized, options.signal);
+      return buildPublicKeyRegistration(res);
+    } catch (err) {
+      if (fallbackSupported && err && typeof err === "object" && err.fallbackRequested) {
+        await waitForWindowFocus();
+        return await nativeCreate(options);
       }
       throw rehydrateError(err);
     }

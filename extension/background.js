@@ -147,19 +147,17 @@ async function addNeverSaveHost(host) {
   }
 }
 
-const PASSKEY_POPOUT_WIDTH = 348;
-// Active passkey popout sessions: sessionId -> session object
-const passkeySessions = new Map();
+const POPOUT_WINDOW_WIDTH = 348;
+// Active in-flight passkey requests: `${tabId}:${requestId}` -> { tabId, context }
+const inFlightPasskeyRequests = new Map();
 const earlyAbortedPasskeyRequests = new Set();
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearPendingSave(tabId);
-  for (const [, session] of passkeySessions) {
-    if (session.tabId === tabId) {
-      session.finish({
-        ok: false,
-        error: { name: "AbortError", message: "The operation either timed out or was not allowed." },
-      });
+  for (const [key, entry] of inFlightPasskeyRequests) {
+    if (entry.tabId === tabId) {
+      inFlightPasskeyRequests.delete(key);
+      callHost("passkeyCancel", { context: entry.context }).catch(() => {});
     }
   }
 });
@@ -169,22 +167,6 @@ chrome.windows.onRemoved.addListener((windowId) => {
     if (entry.windowId === windowId) {
       entry.windowId = null;
       clearPendingSave(tabId, { closeWindow: false });
-    }
-  }
-  for (const [, session] of passkeySessions) {
-    if (session.windowId === windowId) {
-      session.windowId = null;
-      session.finish(
-        session.fallbackSupported
-          ? { ok: false, fallbackRequested: true }
-          : {
-              ok: false,
-              error: {
-                name: "NotAllowedError",
-                message: "The operation either timed out or was not allowed.",
-              },
-            },
-      );
     }
   }
 });
@@ -220,7 +202,7 @@ function callHost(action, params = {}) {
   return new Promise((resolve) => {
     pending.set(id, { resolve });
     try {
-      getPort().postMessage({ id, action, ...params });
+      getPort().postMessage({ ...params, id, action });
     } catch (err) {
       pending.delete(id);
       resolve({
@@ -235,21 +217,6 @@ function callHost(action, params = {}) {
 function isTrustedExtensionPage(sender) {
   const extOrigin = chrome.runtime.getURL("");
   return !sender.tab && typeof sender.url === "string" && sender.url.startsWith(extOrigin);
-}
-
-function isTrustedPasskeyPrompt(sender, session) {
-  const promptPrefix = chrome.runtime.getURL("passkey-prompt.html");
-  if (sender.id !== chrome.runtime.id) return false;
-  if (typeof sender.url !== "string" || !sender.url.startsWith(promptPrefix)) return false;
-  if (sender.frameId != null && sender.frameId !== 0) return false;
-  if (
-    session?.windowId != null &&
-    sender.tab?.windowId != null &&
-    sender.tab.windowId !== session.windowId
-  ) {
-    return false;
-  }
-  return true;
 }
 
 function isTrustedSavePrompt(sender, entry) {
@@ -295,30 +262,33 @@ function resolvePasskeySenderContext(sender, data) {
     return null;
   }
 
-  let sameOriginWithAncestors = sender.frameId === 0;
-  if (sender.frameId !== 0 && Boolean(data?.sameOriginWithAncestors)) {
+  let topOrigin = sender.frameId === 0 ? parsedFrame.origin : null;
+  if (sender.frameId !== 0 && sender.tab.url) {
     try {
-      sameOriginWithAncestors = sender.tab.url
-        ? new URL(sender.tab.url).origin === parsedFrame.origin
-        : false;
+      const parsedTop = new URL(sender.tab.url);
+      if (/^https?:$/i.test(parsedTop.protocol)) {
+        topOrigin = parsedTop.origin;
+      }
     } catch {
-      sameOriginWithAncestors = false;
+      topOrigin = null;
     }
   }
 
+  const sameOriginWithAncestors =
+    sender.frameId === 0 ||
+    (Boolean(data?.sameOriginWithAncestors) && topOrigin === parsedFrame.origin);
+
   return {
     origin: parsedFrame.origin,
+    topOrigin,
     hostname: parsedFrame.hostname.toLowerCase(),
     sameOriginWithAncestors,
   };
 }
 
 function normalizeHostPasskeyReply(res) {
-  if (!res) {
-    return {
-      ok: false,
-      error: { name: "NotAllowedError", message: "Native host unavailable." },
-    };
+  if (!res || res.transportError) {
+    return { ok: false, fallbackRequested: true };
   }
   if (res.ok) return res;
   if (res.fallbackRequested) {
@@ -364,13 +334,24 @@ async function openTopRightPopoutWindow(senderWindowId, url, width, height) {
   return await chrome.windows.create(baseCreate);
 }
 
-async function openPasskeyPopoutWindow(senderWindowId, sessionId, candidateCount = 0) {
-  const url = chrome.runtime.getURL(
-    `passkey-prompt.html?sessionId=${encodeURIComponent(sessionId)}`,
-  );
-  const height =
-    candidateCount > 0 ? Math.min(380, 175 + candidateCount * 52) : 205;
-  return await openTopRightPopoutWindow(senderWindowId, url, PASSKEY_POPOUT_WIDTH, height);
+async function resolveWindowCenterXy(senderWindowId) {
+  if (senderWindowId != null) {
+    try {
+      const win = await chrome.windows.get(senderWindowId);
+      if (
+        typeof win?.left === "number" &&
+        typeof win?.top === "number" &&
+        typeof win?.width === "number" &&
+        typeof win?.height === "number"
+      ) {
+        return {
+          x: Math.round(win.left + win.width / 2),
+          y: Math.round(win.top + win.height / 2),
+        };
+      }
+    } catch {}
+  }
+  return { x: 640, y: 360 };
 }
 
 async function openOrFocusSavePromptWindow(tabId, senderWindowId) {
@@ -417,7 +398,7 @@ async function openOrFocusSavePromptWindow(tabId, senderWindowId) {
     const win = await openTopRightPopoutWindow(
       senderWindowId ?? entry.senderWindowId,
       url,
-      PASSKEY_POPOUT_WIDTH,
+      POPOUT_WINDOW_WIDTH,
       235,
     );
     const cur = pendingSaves.get(tabId);
@@ -462,7 +443,7 @@ async function tryTriggerSpaSavePrompt(tabId, captureId, allowRetry) {
   await openOrFocusSavePromptWindow(tabId, afterProbe.senderWindowId);
 }
 
-async function handlePasskeyGetWithPopout(sender, requestId, rawData) {
+async function handlePasskeyRequest(sender, op, requestId, rawData) {
   const ctx = resolvePasskeySenderContext(sender, rawData);
   if (!ctx) {
     return {
@@ -470,20 +451,35 @@ async function handlePasskeyGetWithPopout(sender, requestId, rawData) {
       error: { name: "SecurityError", message: "Unsupported frame origin" },
     };
   }
+  if (op !== "get" && op !== "create") {
+    return {
+      ok: false,
+      error: { name: "NotSupportedError", message: "Unsupported WebAuthn operation" },
+    };
+  }
+  const fallbackSupported = Boolean(rawData?.fallbackSupported);
+
+  // Delegate cross-origin iframe create() or unverifiable topOrigin to native browser WebAuthn
+  if (
+    (op === "create" && !ctx.sameOriginWithAncestors) ||
+    (!ctx.sameOriginWithAncestors && !ctx.topOrigin)
+  ) {
+    return fallbackSupported
+      ? { ok: false, fallbackRequested: true }
+      : {
+          ok: false,
+          error: {
+            name: "NotAllowedError",
+            message: "The operation either timed out or was not allowed.",
+          },
+        };
+  }
 
   const tabId = sender.tab.id;
+  const frameId = sender.frameId ?? 0;
   const senderWindowId = sender.tab.windowId;
-  const abortKey = `${tabId}:${requestId || ""}`;
-  const fallbackSupported = Boolean(rawData?.fallbackSupported);
-  const rpId = (rawData?.rpId || ctx.hostname).toLowerCase();
-
-  const queryRes = await callHost("passkeyQuery", {
-    origin: ctx.origin,
-    sameOriginWithAncestors: ctx.sameOriginWithAncestors,
-    rpId: rawData?.rpId,
-    allowedCredentials: rawData?.allowedCredentials || [],
-    userVerification: rawData?.userVerification,
-  });
+  const abortKey = `${tabId}:${frameId}:${requestId || ""}`;
+  const windowXy = await resolveWindowCenterXy(senderWindowId);
 
   if (earlyAbortedPasskeyRequests.delete(abortKey)) {
     return {
@@ -492,111 +488,66 @@ async function handlePasskeyGetWithPopout(sender, requestId, rawData) {
     };
   }
 
-  if (!queryRes || queryRes.transportError) {
-    return fallbackSupported
-      ? { ok: false, fallbackRequested: true }
-      : { ok: false, error: { name: "NotAllowedError", message: "Native host unavailable." } };
+  const context = crypto.randomUUID();
+  inFlightPasskeyRequests.set(abortKey, { tabId, context });
+
+  let res;
+  try {
+    res =
+      op === "create"
+        ? await callHost("passkeyRegister", {
+            origin: ctx.origin,
+            topOrigin: ctx.topOrigin,
+            sameOriginWithAncestors: ctx.sameOriginWithAncestors,
+            rpId: rawData?.rpId,
+            rpName: rawData?.rpName,
+            userId: rawData?.userId,
+            userName: rawData?.userName,
+            userDisplayName: rawData?.userDisplayName,
+            challenge: rawData?.challenge,
+            pubKeyCredParams: rawData?.pubKeyCredParams,
+            excludeCredentials: rawData?.excludeCredentials,
+            authenticatorAttachment: rawData?.authenticatorAttachment,
+            userVerification: rawData?.userVerification,
+            timeout: rawData?.timeout,
+            fallbackSupported,
+            windowXy,
+            context,
+          })
+        : await callHost("passkeyAssert", {
+            origin: ctx.origin,
+            topOrigin: ctx.topOrigin,
+            sameOriginWithAncestors: ctx.sameOriginWithAncestors,
+            rpId: rawData?.rpId,
+            challenge: rawData?.challenge,
+            allowedCredentials: rawData?.allowedCredentials,
+            userVerification: rawData?.userVerification,
+            timeout: rawData?.timeout,
+            mediation: rawData?.mediation,
+            fallbackSupported,
+            windowXy,
+            context,
+          });
+  } finally {
+    inFlightPasskeyRequests.delete(abortKey);
   }
 
-  if (!queryRes.ok) {
-    if (queryRes.fallbackRequested) {
-      return fallbackSupported
-        ? { ok: false, fallbackRequested: true }
-        : {
-            ok: false,
-            error: {
-              name: "NotAllowedError",
-              message: "The operation either timed out or was not allowed.",
-            },
-          };
-    }
-    if (queryRes.error === "locked" && rawData?.mediation === "conditional") {
+  const normalized = normalizeHostPasskeyReply(res);
+  if (!normalized.ok && normalized.fallbackRequested) {
+    if (!fallbackSupported) {
       return {
         ok: false,
-        error: { name: "NotAllowedError", message: "Conditional mediation skipped while locked." },
+        error: {
+          name: "NotAllowedError",
+          message: "The operation either timed out or was not allowed.",
+        },
       };
     }
-    if (queryRes.error !== "locked") {
-      return normalizeHostPasskeyReply(queryRes);
+    if (senderWindowId != null) {
+      await chrome.windows.update(senderWindowId, { focused: true }).catch(() => {});
     }
   }
-
-  const initialCandidates = queryRes.ok ? queryRes.candidates || [] : null;
-  if (initialCandidates && initialCandidates.length === 0) {
-    return fallbackSupported
-      ? { ok: false, fallbackRequested: true }
-      : { ok: false, error: { name: "NotAllowedError", message: "No matching passkey found." } };
-  }
-
-  // Close any superseded passkey popout before opening a new one
-  for (const [, prevSession] of passkeySessions) {
-    prevSession.finish({
-      ok: false,
-      error: { name: "AbortError", message: "Superseded by a newer WebAuthn request." },
-    });
-  }
-
-  const sessionId = crypto.randomUUID();
-
-  return await new Promise((resolve) => {
-    const session = {
-      sessionId,
-      requestId: requestId || "",
-      tabId,
-      senderWindowId,
-      windowId: null,
-      origin: ctx.origin,
-      sameOriginWithAncestors: ctx.sameOriginWithAncestors,
-      rpId,
-      rawRpId: rawData?.rpId,
-      challenge: rawData?.challenge,
-      allowedCredentials: rawData?.allowedCredentials || [],
-      userVerification: rawData?.userVerification,
-      fallbackSupported,
-      email: queryRes.email || "",
-      candidates: initialCandidates,
-      settled: false,
-      finish(reply) {
-        if (this.settled) return;
-        this.settled = true;
-        passkeySessions.delete(sessionId);
-        const winToClose = this.windowId;
-        this.windowId = null;
-        (async () => {
-          if (winToClose != null) {
-            await chrome.windows.remove(winToClose).catch(() => {});
-          }
-          if (reply?.fallbackRequested && this.senderWindowId != null) {
-            await chrome.windows.update(this.senderWindowId, { focused: true }).catch(() => {});
-          }
-          resolve(reply);
-        })();
-      },
-    };
-
-    passkeySessions.set(sessionId, session);
-
-    openPasskeyPopoutWindow(senderWindowId, sessionId, initialCandidates?.length || 0)
-      .then((win) => {
-        if (session.settled) {
-          if (win?.id != null) {
-            chrome.windows.remove(win.id).catch(() => {});
-          }
-          return;
-        }
-        session.windowId = win?.id ?? null;
-      })
-      .catch(() => {
-        session.finish(
-          fallbackSupported
-            ? { ok: false, fallbackRequested: true }
-            : {
-                ok: false,
-                error: { name: "NotAllowedError", message: "Unable to open passkey window." },
-              },
-        );
-      });
-  });
+  return normalized;
 }
 
 // Cmd+Shift+L: if locked, prompts biometrics in-place and immediately fills same-origin frames
@@ -869,117 +820,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return { ok: true };
       }
 
-      case "passkey-get-request": {
-        return await handlePasskeyGetWithPopout(sender, msg.requestId, msg.data);
+      case "passkey-request": {
+        return await handlePasskeyRequest(sender, msg.op, msg.requestId, msg.data);
       }
 
       case "passkey-abort": {
         const tabId = sender.tab?.id;
         if (!tabId || !msg.requestId) return { ok: true };
-        let matched = false;
-        for (const [, session] of passkeySessions) {
-          if (session.tabId === tabId && session.requestId === msg.requestId) {
-            matched = true;
-            session.finish({
-              ok: false,
-              error: {
-                name: "AbortError",
-                message: "The operation either timed out or was not allowed.",
-              },
-            });
-          }
-        }
-        if (!matched) {
-          const abortKey = `${tabId}:${msg.requestId}`;
+        const frameId = sender.frameId ?? 0;
+        const abortKey = `${tabId}:${frameId}:${msg.requestId}`;
+        const active = inFlightPasskeyRequests.get(abortKey);
+        if (active) {
+          inFlightPasskeyRequests.delete(abortKey);
+          await callHost("passkeyCancel", { context: active.context }).catch(() => {});
+        } else {
           earlyAbortedPasskeyRequests.add(abortKey);
           setTimeout(() => earlyAbortedPasskeyRequests.delete(abortKey), 15_000);
-        }
-        return { ok: true };
-      }
-
-      case "passkey-prompt-init": {
-        const session = passkeySessions.get(msg.sessionId);
-        if (!isTrustedPasskeyPrompt(sender, session)) {
-          return { ok: false, error: "forbidden_sender" };
-        }
-        if (!session || session.settled) {
-          return { ok: false, error: "session_not_found" };
-        }
-        return {
-          ok: true,
-          rpId: session.rpId,
-          email: session.email,
-          fallbackSupported: session.fallbackSupported,
-          candidates: session.candidates,
-        };
-      }
-
-      case "passkey-prompt-assert": {
-        const session = passkeySessions.get(msg.sessionId);
-        if (!isTrustedPasskeyPrompt(sender, session)) {
-          return { ok: false, error: "forbidden_sender" };
-        }
-        if (!session || session.settled) {
-          return { ok: false, error: { name: "NotAllowedError", message: "Session expired." } };
-        }
-
-        const res = await callHost("passkeyAssert", {
-          origin: session.origin,
-          sameOriginWithAncestors: session.sameOriginWithAncestors,
-          rpId: session.rawRpId,
-          challenge: session.challenge,
-          allowedCredentials: session.allowedCredentials,
-          userVerification: session.userVerification,
-          selectedCredentialId: msg.selectedCredentialId || null,
-        });
-
-        if (session.settled) {
-          return { ok: false };
-        }
-
-        if (res?.ok && Array.isArray(res.candidates)) {
-          session.candidates = res.candidates;
-          return { ok: true, rpId: session.rpId, candidates: res.candidates };
-        }
-
-        const normalized = normalizeHostPasskeyReply(res);
-        if (!normalized.ok && normalized.retryable) {
-          return normalized;
-        }
-
-        if (!normalized.ok && normalized.fallbackRequested && !session.fallbackSupported) {
-          const noFallbackErr = {
-            ok: false,
-            error: {
-              name: "NotAllowedError",
-              message: "The operation either timed out or was not allowed.",
-            },
-          };
-          session.finish(noFallbackErr);
-          return noFallbackErr;
-        }
-
-        session.finish(normalized);
-        return normalized;
-      }
-
-      case "passkey-prompt-cancel": {
-        const session = passkeySessions.get(msg.sessionId);
-        if (!isTrustedPasskeyPrompt(sender, session)) {
-          return { ok: false, error: "forbidden_sender" };
-        }
-        if (session && !session.settled) {
-          session.finish(
-            msg.fallback && session.fallbackSupported
-              ? { ok: false, fallbackRequested: true }
-              : {
-                  ok: false,
-                  error: {
-                    name: "NotAllowedError",
-                    message: "The operation either timed out or was not allowed.",
-                  },
-                },
-          );
         }
         return { ok: true };
       }

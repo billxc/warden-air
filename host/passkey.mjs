@@ -1,12 +1,12 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 
-const AAGUID_ZERO = Buffer.alloc(16, 0);
-
-const FLAG_UP = 0x01; // User Present
-const FLAG_UV = 0x04; // User Verified
-const FLAG_BE = 0x08; // Backup Eligibility
-const FLAG_BS = 0x10; // Backup State
-const FLAG_AT = 0x40; // Attested Credential Data
+const MAX_IPC_FRAME_BYTES = 1024 * 1024;
+const ES256_ALG = -7;
+const RS256_ALG = -257;
 
 const MULTI_PART_TLDS = new Set([
   "co.uk",
@@ -64,571 +64,719 @@ export class FallbackRequestedError extends Error {
 }
 
 export function toBase64Url(buf) {
-  return Buffer.from(buf).toString("base64url");
+  return Buffer.from(buf)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 }
 
 export function fromBase64Url(str) {
-  if (typeof str !== "string" || !/^[A-Za-z0-9_-]*={0,2}$/.test(str)) {
-    throw new TypeError("Invalid base64url string");
+  if (typeof str !== "string") {
+    throw new TypeError("Expected base64url string");
   }
-  const normalized = str.replace(/=/g, "");
-  if (normalized.length % 4 === 1) {
-    throw new TypeError("Invalid base64url length");
-  }
-  return Buffer.from(normalized, "base64url");
+  const normalized = str.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = normalized.length % 4 === 0 ? "" : "=".repeat(4 - (normalized.length % 4));
+  return Buffer.from(normalized + pad, "base64");
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-export function credentialIdToBytes(storedCredentialId) {
-  if (typeof storedCredentialId !== "string" || !storedCredentialId) return null;
-  if (storedCredentialId.startsWith("b64.")) {
-    try {
-      return fromBase64Url(storedCredentialId.slice(4));
-    } catch {
-      return null;
-    }
-  }
-  if (UUID_RE.test(storedCredentialId)) {
-    return Buffer.from(storedCredentialId.replace(/-/g, ""), "hex");
-  }
-  try {
-    return fromBase64Url(storedCredentialId);
-  } catch {
-    return null;
-  }
+function isIpLiteral(hostname) {
+  return (
+    hostname.startsWith("[") ||
+    /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) ||
+    hostname.includes(":")
+  );
 }
 
-export function bytesToUuid(buf) {
-  if (!buf || buf.length !== 16) {
-    throw new TypeError("UUID buffer must be 16 bytes");
-  }
-  const hex = Buffer.from(buf).toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
-}
-
-function isIpLiteral(host) {
-  return host.startsWith("[") || /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
-}
-
-function isPublicSuffixOnly(domain) {
-  if (!domain.includes(".")) return domain !== "localhost";
-  if (MULTI_PART_TLDS.has(domain) || SHARED_HOSTING_SUFFIXES.has(domain)) return true;
+function isPublicSuffixOnly(rpId) {
+  const clean = rpId.toLowerCase();
+  if (clean === "localhost") return false;
+  if (!clean.includes(".")) return true;
+  if (MULTI_PART_TLDS.has(clean)) return true;
+  if (SHARED_HOSTING_SUFFIXES.has(clean)) return true;
   return false;
-}
-
-export function isValidRpIdForOrigin(rpId, origin) {
-  let url;
-  try {
-    url = new URL(origin);
-  } catch {
-    return false;
-  }
-
-  const host = url.hostname.toLowerCase();
-  if (!host || isIpLiteral(host)) return false;
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && host === "localhost")) {
-    return false;
-  }
-
-  const candidate = String(rpId || "").toLowerCase();
-  if (!candidate || isIpLiteral(candidate)) return false;
-  if (/[:/\s?#]/.test(candidate) || candidate.startsWith(".") || candidate.endsWith(".")) {
-    return false;
-  }
-  if (isPublicSuffixOnly(candidate)) return false;
-
-  if (host === candidate) {
-    return true;
-  }
-
-  return host.endsWith(`.${candidate}`);
 }
 
 export function resolveOriginAndRpId(origin, requestedRpId) {
+  if (typeof origin !== "string" || !origin) {
+    throw new WebAuthnError("SecurityError", "Invalid origin");
+  }
   let url;
   try {
     url = new URL(origin);
   } catch {
-    throw new WebAuthnError("SecurityError", "Origin is not a valid URL");
+    throw new WebAuthnError("SecurityError", "Malformed origin URL");
   }
 
-  const host = url.hostname.toLowerCase();
-  if (!host || isIpLiteral(host)) {
-    throw new WebAuthnError("SecurityError", "Origin is not a valid domain");
+  const hostname = url.hostname.toLowerCase();
+  const isLocalhostHttp = url.protocol === "http:" && hostname === "localhost";
+  if (url.protocol !== "https:" && !isLocalhostHttp) {
+    throw new WebAuthnError("SecurityError", "WebAuthn requires an HTTPS origin or localhost");
   }
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && host === "localhost")) {
-    throw new WebAuthnError("SecurityError", "Origin must use HTTPS or http://localhost");
-  }
-
-  const rpId = (requestedRpId || host).toLowerCase();
-  if (!isValidRpIdForOrigin(rpId, origin)) {
-    throw new WebAuthnError("SecurityError", `RP ID '${rpId}' is not valid for origin '${origin}'`);
+  if (isIpLiteral(hostname)) {
+    throw new WebAuthnError("SecurityError", "Origin host is not a valid domain");
   }
 
-  return { origin: url.origin, hostname: host, rpId };
-}
-
-export function isHardwareOnlyAllowList(allowedCredentials) {
-  const allowed = Array.isArray(allowedCredentials) ? allowedCredentials : [];
-  return (
-    allowed.length > 0 &&
-    allowed.every(
-      (c) =>
-        Array.isArray(c.transports) &&
-        c.transports.length > 0 &&
-        !c.transports.includes("internal") &&
-        !c.transports.includes("hybrid"),
-    )
-  );
-}
-
-function resolveResidentKeyRequirement(selection) {
-  const rk = selection?.residentKey;
-  if (rk === "required" || rk === "preferred") return true;
-  if (rk === "discouraged") return false;
-  if (selection?.requireResidentKey != null) {
-    if (typeof selection.requireResidentKey !== "boolean") {
-      throw new WebAuthnError("NotAllowedError", "Invalid requireResidentKey value");
-    }
-    return selection.requireResidentKey;
+  if (requestedRpId === undefined || requestedRpId === null || requestedRpId === "") {
+    return { origin: url.origin, rpId: hostname };
   }
-  return false;
+  if (typeof requestedRpId !== "string") {
+    throw new WebAuthnError("SecurityError", "Invalid rpId");
+  }
+
+  let candidate = requestedRpId.toLowerCase();
+  if (
+    candidate !== requestedRpId &&
+    /[:/?#\\\s]/.test(requestedRpId)
+  ) {
+    throw new WebAuthnError("SecurityError", "Malformed rpId");
+  }
+  if (/[:/?#\\\s]/.test(candidate) || candidate.startsWith(".") || candidate.endsWith(".")) {
+    throw new WebAuthnError("SecurityError", "Malformed rpId");
+  }
+  if (isIpLiteral(candidate)) {
+    throw new WebAuthnError("SecurityError", "IP address cannot be used as rpId");
+  }
+  if (isPublicSuffixOnly(candidate)) {
+    throw new WebAuthnError("SecurityError", "rpId cannot be a registrable public suffix");
+  }
+  if (hostname !== candidate && !hostname.endsWith(`.${candidate}`)) {
+    throw new WebAuthnError("SecurityError", "rpId is not a registrable domain suffix of origin");
+  }
+
+  return { origin: url.origin, rpId: candidate };
 }
 
 export function resolveUserVerificationRequirement(uv) {
-  if (uv == null || uv === "preferred" || uv === "discouraged") return false;
-  if (uv === "required") return true;
-  throw new WebAuthnError("NotAllowedError", `Invalid userVerification value: ${String(uv)}`);
+  if (uv === undefined || uv === null || uv === "") return "preferred";
+  if (uv === "required" || uv === "preferred" || uv === "discouraged") return uv;
+  throw new TypeError(`Unsupported userVerification value: ${String(uv)}`);
 }
 
-// Deterministic CTAP2 canonical CBOR encoding for COSE EC2 ES256 P-256 public key (77 bytes)
-// { 1: 2 (EC2), 3: -7 (ES256), -1: 1 (P-256), -2: x (32B), -3: y (32B) }
-export function encodeCoseEc2PublicKey(xBytes, yBytes) {
-  if (xBytes.length !== 32 || yBytes.length !== 32) {
-    throw new Error("Invalid P-256 coordinate length");
+export function isHardwareOnlyAllowList(allowedCredentials) {
+  if (!Array.isArray(allowedCredentials) || allowedCredentials.length === 0) return false;
+  return allowedCredentials.every((cred) => {
+    if (!Array.isArray(cred?.transports) || cred.transports.length === 0) return false;
+    return !cred.transports.includes("internal") && !cred.transports.includes("hybrid");
+  });
+}
+
+export function buildClientDataAndHash({ type, challenge, origin, crossOrigin, topOrigin }) {
+  if (typeof challenge !== "string" || !challenge) {
+    throw new TypeError("Missing challenge");
   }
-  const out = Buffer.alloc(77);
-  out.set([0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20], 0);
-  out.set(xBytes, 10);
-  out.set([0x22, 0x58, 0x20], 42);
-  out.set(yBytes, 45);
-  return out;
-}
-
-function encodeCborByteStringHeader(len) {
-  if (len < 24) return Buffer.from([0x40 | len]);
-  if (len <= 0xff) return Buffer.from([0x58, len]);
-  if (len <= 0xffff) {
-    const b = Buffer.alloc(3);
-    b[0] = 0x59;
-    b.writeUInt16BE(len, 1);
-    return b;
+  const normalizedChallenge = toBase64Url(fromBase64Url(challenge));
+  const isCrossOrigin = Boolean(crossOrigin);
+  const clientDataObj = {
+    type,
+    challenge: normalizedChallenge,
+    origin,
+    crossOrigin: isCrossOrigin,
+  };
+  if (isCrossOrigin && typeof topOrigin === "string" && topOrigin) {
+    clientDataObj.topOrigin = topOrigin;
   }
-  const b = Buffer.alloc(5);
-  b[0] = 0x5a;
-  b.writeUInt32BE(len, 1);
-  return b;
-}
-
-// Deterministic CBOR encoding for { "fmt": "none", "attStmt": {}, "authData": <bstr> }
-export function encodeNoneAttestationObject(authData) {
-  const prefix = Buffer.from([
-    0xa3, // map(3)
-    0x63, 0x66, 0x6d, 0x74, // "fmt"
-    0x64, 0x6e, 0x6f, 0x6e, 0x65, // "none"
-    0x67, 0x61, 0x74, 0x74, 0x53, 0x74, 0x6d, 0x74, // "attStmt"
-    0xa0, // map(0)
-    0x68, 0x61, 0x75, 0x74, 0x68, 0x44, 0x61, 0x74, 0x61, // "authData"
-  ]);
-  return Buffer.concat([prefix, encodeCborByteStringHeader(authData.length), authData]);
-}
-
-export function buildAuthenticatorData({
-  rpId,
-  counter = 0,
-  userPresent = true,
-  userVerified = false,
-  attestedCredential = null,
-}) {
-  const rpIdHash = crypto.createHash("sha256").update(rpId, "utf8").digest();
-  let flags = FLAG_BE | FLAG_BS;
-  if (userPresent) flags |= FLAG_UP;
-  if (userVerified) flags |= FLAG_UV;
-  if (attestedCredential) flags |= FLAG_AT;
-
-  const counterBuf = Buffer.alloc(4);
-  counterBuf.writeUInt32BE(counter >>> 0, 0);
-
-  if (!attestedCredential) {
-    return Buffer.concat([rpIdHash, Buffer.from([flags]), counterBuf]);
-  }
-
-  const { rawCredentialId, cosePublicKey } = attestedCredential;
-  const credLenBuf = Buffer.alloc(2);
-  credLenBuf.writeUInt16BE(rawCredentialId.length, 0);
-
-  return Buffer.concat([
-    rpIdHash,
-    Buffer.from([flags]),
-    counterBuf,
-    AAGUID_ZERO,
-    credLenBuf,
-    rawCredentialId,
-    cosePublicKey,
-  ]);
-}
-
-export function decryptPasskeyRecord(rawFido2, decryptStr, meta = {}) {
-  if (!rawFido2) return null;
-  const credentialId = decryptStr(rawFido2.credentialId);
-  const keyType = decryptStr(rawFido2.keyType);
-  const keyAlgorithm = decryptStr(rawFido2.keyAlgorithm);
-  const keyCurve = decryptStr(rawFido2.keyCurve);
-  const keyValue = decryptStr(rawFido2.keyValue);
-  const rpId = decryptStr(rawFido2.rpId);
-  if (!credentialId || !keyValue || !rpId) return null;
-
-  const rawId = credentialIdToBytes(credentialId);
-  if (!rawId) return null;
-
-  const counterStr = decryptStr(rawFido2.counter);
-  const discoverableStr = decryptStr(rawFido2.discoverable);
-
+  const utf8 = Buffer.from(JSON.stringify(clientDataObj), "utf8");
+  const hashBuf = crypto.createHash("sha256").update(utf8).digest();
   return {
-    cipherId: meta.cipherId || null,
-    organizationId: meta.organizationId || null,
-    reprompt: meta.reprompt || 0,
-    lastUsedDate: meta.lastUsedDate || 0,
-    credentialId,
-    rawId,
-    webauthnId: toBase64Url(rawId),
-    keyType: keyType || "public-key",
-    keyAlgorithm: keyAlgorithm || "ECDSA",
-    keyCurve: keyCurve || "P-256",
-    keyValue,
-    rpId: rpId.toLowerCase(),
-    rpName: rawFido2.rpName ? decryptStr(rawFido2.rpName) || "" : "",
-    userHandle: rawFido2.userHandle ? decryptStr(rawFido2.userHandle) || "" : "",
-    userName: rawFido2.userName ? decryptStr(rawFido2.userName) || "" : "",
-    userDisplayName: rawFido2.userDisplayName ? decryptStr(rawFido2.userDisplayName) || "" : "",
-    counter: Number.parseInt(counterStr ?? "0", 10) || 0,
-    discoverable: String(discoverableStr).toLowerCase() === "true",
-    creationDate: rawFido2.creationDate || new Date().toISOString(),
+    clientDataJSON: toBase64Url(utf8),
+    clientDataHash: Array.from(hashBuf),
+    clientDataHashBuf: hashBuf,
   };
 }
 
-export function encryptPasskeyRecord(record, encryptStr) {
-  return {
-    credentialId: encryptStr(record.credentialId),
-    keyType: encryptStr(record.keyType || "public-key"),
-    keyAlgorithm: encryptStr(record.keyAlgorithm || "ECDSA"),
-    keyCurve: encryptStr(record.keyCurve || "P-256"),
-    keyValue: encryptStr(record.keyValue),
-    rpId: encryptStr(record.rpId),
-    rpName: record.rpName != null ? encryptStr(record.rpName) : null,
-    userHandle: record.userHandle != null ? encryptStr(record.userHandle) : null,
-    userName: record.userName != null ? encryptStr(record.userName) : null,
-    userDisplayName: record.userDisplayName != null ? encryptStr(record.userDisplayName) : null,
-    counter: encryptStr(String(record.counter ?? 0)),
-    discoverable: encryptStr(record.discoverable ? "true" : "false"),
-    creationDate: record.creationDate || new Date().toISOString(),
-  };
-}
+function decodeCborItem(buf, offset = 0) {
+  if (offset >= buf.length) throw new Error("Unexpected end of CBOR buffer");
+  const initial = buf[offset++];
+  const major = initial >> 5;
+  const info = initial & 0x1f;
 
-function checkAborted(abortSignal) {
-  if (abortSignal?.aborted) {
-    throw new WebAuthnError("AbortError", "The operation either timed out or was not allowed.");
+  let val;
+  if (info < 24) {
+    val = info;
+  } else if (info === 24) {
+    val = buf[offset++];
+  } else if (info === 25) {
+    val = buf.readUInt16BE(offset);
+    offset += 2;
+  } else if (info === 26) {
+    val = buf.readUInt32BE(offset);
+    offset += 4;
+  } else {
+    throw new Error(`Unsupported CBOR additional info: ${info}`);
+  }
+
+  switch (major) {
+    case 0:
+      return { value: val, next: offset };
+    case 1:
+      return { value: -1 - val, next: offset };
+    case 2:
+      return { value: buf.subarray(offset, offset + val), next: offset + val };
+    case 3:
+      return { value: buf.subarray(offset, offset + val).toString("utf8"), next: offset + val };
+    case 4: {
+      const arr = [];
+      for (let i = 0; i < val; i++) {
+        const elem = decodeCborItem(buf, offset);
+        arr.push(elem.value);
+        offset = elem.next;
+      }
+      return { value: arr, next: offset };
+    }
+    case 5: {
+      const map = new Map();
+      for (let i = 0; i < val; i++) {
+        const k = decodeCborItem(buf, offset);
+        const v = decodeCborItem(buf, k.next);
+        map.set(k.value, v.value);
+        offset = v.next;
+      }
+      return { value: map, next: offset };
+    }
+    default:
+      throw new Error(`Unsupported CBOR major type: ${major}`);
   }
 }
 
-export function findMatchingPasskeys(records, { rpId, allowedCredentials = [] }) {
-  const targetRpId = rpId.toLowerCase();
-  const hasAllowList = Array.isArray(allowedCredentials) && allowedCredentials.length > 0;
+export function extractAttestationMetadata(attestationObjectBuf) {
+  const decoded = decodeCborItem(Buffer.from(attestationObjectBuf), 0).value;
+  if (!(decoded instanceof Map)) {
+    throw new Error("Invalid CBOR attestationObject");
+  }
+  const authData = decoded.get("authData");
+  if (!Buffer.isBuffer(authData) || authData.length < 55) {
+    throw new Error("Missing attested authenticatorData");
+  }
 
-  let allowedRawIds = null;
-  if (hasAllowList) {
-    allowedRawIds = [];
-    for (const item of allowedCredentials) {
-      const bytes = credentialIdToBytes(item.id);
-      if (bytes) allowedRawIds.push(bytes);
+  let publicKeyDer = null;
+  let publicKeyAlgorithm = ES256_ALG;
+
+  const flags = authData[32];
+  if ((flags & 0x40) !== 0) {
+    const credIdLen = authData.readUInt16BE(53);
+    const coseOffset = 55 + credIdLen;
+    if (coseOffset < authData.length) {
+      const coseMap = decodeCborItem(authData, coseOffset).value;
+      if (coseMap instanceof Map) {
+        const alg = coseMap.get(3);
+        if (typeof alg === "number") publicKeyAlgorithm = alg;
+        const x = coseMap.get(-2);
+        const y = coseMap.get(-3);
+        if (
+          coseMap.get(1) === 2 &&
+          coseMap.get(-1) === 1 &&
+          Buffer.isBuffer(x) &&
+          Buffer.isBuffer(y)
+        ) {
+          publicKeyDer = crypto
+            .createPublicKey({
+              key: { kty: "EC", crv: "P-256", x: toBase64Url(x), y: toBase64Url(y) },
+              format: "jwk",
+            })
+            .export({ type: "spki", format: "der" });
+        }
+      }
     }
   }
 
-  return records
-    .filter((rec) => {
-      if (!rec || rec.rpId.toLowerCase() !== targetRpId) return false;
-      if (rec.keyAlgorithm !== "ECDSA" || rec.keyCurve !== "P-256") return false;
-      const rawId = rec.rawId || credentialIdToBytes(rec.credentialId);
-      if (!rawId) return false;
-      if (hasAllowList) {
-        return allowedRawIds.some((id) => id.length === rawId.length && id.equals(rawId));
-      }
-      return Boolean(rec.discoverable);
-    })
-    .sort((a, b) => (b.lastUsedDate || 0) - (a.lastUsedDate || 0));
+  return {
+    authenticatorData: toBase64Url(authData),
+    publicKey: publicKeyDer ? toBase64Url(publicKeyDer) : null,
+    publicKeyAlgorithm,
+  };
 }
 
-export function createPasskeyCredential(params, context = {}) {
-  const {
-    existingRecords = [],
-    neverDomains = null,
-    passkeysEnabled = true,
-    userVerified = true,
-    abortSignal = null,
-  } = context;
-
-  checkAborted(abortSignal);
-
-  if (!passkeysEnabled) {
-    throw new FallbackRequestedError();
+export function resolveAutofillSocketPath() {
+  if (process.env.BW_AUTOFILL_SOCKET) {
+    return process.env.BW_AUTOFILL_SOCKET;
   }
-
-  if (!params.sameOriginWithAncestors) {
-    throw new WebAuthnError(
-      "NotAllowedError",
-      "Passkey creation is not allowed in cross-origin frames",
+  if (process.platform === "win32") {
+    return null;
+  }
+  if (process.platform === "darwin") {
+    const groupSock = path.join(
+      os.homedir(),
+      "Library",
+      "Group Containers",
+      "LTZ2PFU5D6.com.bitwarden.desktop",
+      "s.af",
     );
+    const cacheSock = path.join(
+      os.homedir(),
+      "Library",
+      "Caches",
+      "com.bitwarden.desktop",
+      "s.af",
+    );
+    return fs.existsSync(cacheSock) ? cacheSock : groupSock;
+  }
+  return path.join(os.homedir(), ".cache", "com.bitwarden.desktop", "s.af");
+}
+
+function writeLengthPrefixedFrame(stream, jsonStr) {
+  const payload = Buffer.from(jsonStr, "utf8");
+  const header = Buffer.alloc(4);
+  header.writeUInt32LE(payload.length, 0);
+  stream.write(Buffer.concat([header, payload]));
+}
+
+export class AutofillIpcClient {
+  #resolveSocketPath;
+  #launchDesktop;
+  #socket = null;
+  #connectPromise = null;
+  #nextSeq = crypto.randomInt(0x1000_0000, 0x7000_0000);
+  #pending = new Map();
+  #cancelledContexts = new Set();
+
+  constructor({
+    socketPathResolver = resolveAutofillSocketPath,
+    launchDesktop = null,
+  } = {}) {
+    this.#resolveSocketPath = socketPathResolver;
+    this.#launchDesktop = launchDesktop;
   }
 
-  const { origin, hostname, rpId } = resolveOriginAndRpId(params.origin, params.rp?.id);
-  if (neverDomains?.has?.(hostname)) {
-    throw new FallbackRequestedError();
+  close() {
+    const sock = this.#socket;
+    this.#socket = null;
+    this.#connectPromise = null;
+    if (sock) {
+      sock.destroy();
+    }
+    this.#rejectAllPending(new WebAuthnError("NotAllowedError", "Autofill IPC closed"));
   }
 
-  const userIdBytes = fromBase64Url(params.user?.id ?? "");
-  if (userIdBytes.length < 1 || userIdBytes.length > 64) {
-    throw new TypeError("Invalid user.id byte length (must be 1..64 bytes)");
+  #rejectAllPending(err) {
+    for (const [, entry] of this.#pending) {
+      clearTimeout(entry.timer);
+      entry.reject(err);
+    }
+    this.#pending.clear();
   }
 
-  const rawAlgs =
-    Array.isArray(params.pubKeyCredParams) && params.pubKeyCredParams.length > 0
-      ? params.pubKeyCredParams
-      : [
-          { type: "public-key", alg: -7 },
-          { type: "public-key", alg: -257 },
-        ];
+  #connectOnce(sockPath) {
+    return new Promise((resolve, reject) => {
+      const socket = net.createConnection(sockPath);
+      let connected = false;
+      let buf = Buffer.alloc(0);
 
-  const supportsEs256 = rawAlgs.some((p) => p?.type === "public-key" && Number(p.alg) === -7);
-  if (!supportsEs256) {
-    throw new WebAuthnError("NotSupportedError", "No supported public-key algorithm (ES256)");
-  }
+      const onInitialError = (err) => {
+        socket.destroy();
+        reject(err);
+      };
 
-  const discoverable = resolveResidentKeyRequirement(params.authenticatorSelection);
-  const requireUv = resolveUserVerificationRequirement(
-    params.authenticatorSelection?.userVerification,
-  );
-  if (requireUv && !userVerified) {
-    throw new WebAuthnError("NotAllowedError", "User verification required");
-  }
+      socket.once("error", onInitialError);
 
-  if (Array.isArray(params.excludeCredentials) && params.excludeCredentials.length > 0) {
-    const excludedRawIds = params.excludeCredentials
-      .filter((c) => !c?.type || c.type === "public-key")
-      .map((c) => credentialIdToBytes(c.id))
-      .filter(Boolean);
+      socket.once("connect", () => {
+        connected = true;
+        socket.removeListener("error", onInitialError);
 
-    const hasExcluded = existingRecords.some((rec) => {
-      if (!rec || rec.organizationId != null || rec.rpId.toLowerCase() !== rpId) return false;
-      const rawId = rec.rawId || credentialIdToBytes(rec.credentialId);
-      return rawId && excludedRawIds.some((ex) => ex.length === rawId.length && ex.equals(rawId));
+        socket.on("data", (chunk) => {
+          buf = Buffer.concat([buf, chunk]);
+          while (buf.length >= 4) {
+            const frameLen = buf.readUInt32LE(0);
+            if (frameLen > MAX_IPC_FRAME_BYTES) {
+              socket.destroy();
+              return;
+            }
+            if (buf.length < 4 + frameLen) break;
+            const raw = buf.subarray(4, 4 + frameLen).toString("utf8");
+            buf = buf.subarray(4 + frameLen);
+            this.#handleIncomingFrame(raw);
+          }
+        });
+
+        const onClose = () => {
+          if (this.#socket === socket) {
+            this.#socket = null;
+          }
+          this.#rejectAllPending(
+            new WebAuthnError("NotAllowedError", "The operation either timed out or was not allowed."),
+          );
+        };
+
+        socket.on("error", onClose);
+        socket.on("close", onClose);
+
+        // Required first frame for Bitwarden AutofillIpcServer
+        writeLengthPrefixedFrame(socket, JSON.stringify({ clientType: "autofill" }));
+        this.#socket = socket;
+        resolve(socket);
+      });
     });
+  }
 
-    if (hasExcluded) {
-      throw new WebAuthnError(
-        "InvalidStateError",
-        "An excluded credential already exists in this vault",
+  #handleIncomingFrame(raw) {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg.sequence_number !== "number") {
+      return;
+    }
+    const entry = this.#pending.get(msg.sequence_number);
+    if (!entry) return;
+
+    const val = msg.value;
+    if (val && typeof val === "object" && "Ok" in val) {
+      const okVal = val.Ok;
+      if (
+        entry.expectedRpId &&
+        (okVal?.rpId !== entry.expectedRpId ||
+          !Array.isArray(okVal?.clientDataHash) ||
+          !Buffer.from(okVal.clientDataHash).equals(entry.expectedHashBuf))
+      ) {
+        // Ignore broadcast reply intended for a different client on a colliding sequence number
+        return;
+      }
+      this.#pending.delete(msg.sequence_number);
+      clearTimeout(entry.timer);
+      if (entry.context && this.#cancelledContexts.has(entry.context)) {
+        entry.reject(
+          new WebAuthnError("AbortError", "The operation either timed out or was not allowed."),
+        );
+        return;
+      }
+      entry.resolve(okVal);
+      return;
+    }
+
+    this.#pending.delete(msg.sequence_number);
+    clearTimeout(entry.timer);
+
+    const errPayload = val?.Err;
+    if (errPayload === "CredentialNotFound") {
+      entry.reject(new FallbackRequestedError("No matching passkey in Bitwarden"));
+      return;
+    }
+    if (errPayload === "ExcludedCredentialMatched") {
+      entry.reject(
+        new WebAuthnError(
+          "InvalidStateError",
+          "The authenticator already contains one of the excluded credentials.",
+        ),
+      );
+      return;
+    }
+
+    const detail =
+      typeof errPayload === "object" && errPayload?.Internal
+        ? String(errPayload.Internal)
+        : "The operation either timed out or was not allowed.";
+    entry.reject(new WebAuthnError("NotAllowedError", detail));
+  }
+
+  async #ensureConnected({ allowLaunch = false } = {}) {
+    if (this.#socket && !this.#socket.destroyed) {
+      return this.#socket;
+    }
+    if (this.#connectPromise) {
+      return await this.#connectPromise;
+    }
+
+    const sockPath = this.#resolveSocketPath();
+    if (!sockPath) {
+      throw new FallbackRequestedError("Autofill socket not supported on this platform");
+    }
+
+    this.#connectPromise = (async () => {
+      try {
+        return await this.#connectOnce(sockPath);
+      } catch {
+        if (!allowLaunch || !this.#launchDesktop) {
+          throw new FallbackRequestedError("Bitwarden autofill socket is not listening");
+        }
+        this.#launchDesktop();
+        const deadline = Date.now() + 3500;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 250));
+          try {
+            return await this.#connectOnce(sockPath);
+          } catch {}
+        }
+        throw new FallbackRequestedError("Bitwarden autofill socket did not become ready");
+      } finally {
+        this.#connectPromise = null;
+      }
+    })();
+
+    return await this.#connectPromise;
+  }
+
+  #sendCancelFrame(context) {
+    if (!context || !this.#socket || this.#socket.destroyed) return;
+    try {
+      writeLengthPrefixedFrame(
+        this.#socket,
+        JSON.stringify({
+          sequenceNumber: 0,
+          request: "cancelRequest",
+          params: String(context),
+        }),
+      );
+    } catch {}
+  }
+
+  #rememberCancelledContext(context) {
+    if (!context) return;
+    this.#cancelledContexts.add(String(context));
+    if (this.#cancelledContexts.size > 128) {
+      const oldest = this.#cancelledContexts.values().next().value;
+      this.#cancelledContexts.delete(oldest);
+    }
+  }
+
+  async #sendRequest(
+    requestName,
+    params,
+    timeoutMs = 120_000,
+    { allowLaunch = true, context = null, expectedRpId = null, expectedHashBuf = null } = {},
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    if (context && this.#cancelledContexts.has(context)) {
+      throw new WebAuthnError("AbortError", "The operation either timed out or was not allowed.");
+    }
+
+    // Supersede any existing active ceremony so two tabs cannot fight over Desktop's single modal UI
+    for (const [prevSeq, prevEntry] of this.#pending) {
+      this.#pending.delete(prevSeq);
+      clearTimeout(prevEntry.timer);
+      if (prevEntry.context) {
+        this.#rememberCancelledContext(prevEntry.context);
+        this.#sendCancelFrame(prevEntry.context);
+      }
+      prevEntry.reject(
+        new WebAuthnError("AbortError", "Superseded by a newer WebAuthn request."),
       );
     }
-  }
 
-  checkAborted(abortSignal);
-
-  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", {
-    namedCurve: "prime256v1",
-  });
-  const pkcs8Der = privateKey.export({ type: "pkcs8", format: "der" });
-  const spkiDer = publicKey.export({ type: "spki", format: "der" });
-  const jwk = publicKey.export({ format: "jwk" });
-  const cosePublicKey = encodeCoseEc2PublicKey(fromBase64Url(jwk.x), fromBase64Url(jwk.y));
-
-  const rawCredentialId = crypto.randomBytes(16);
-  rawCredentialId[6] = (rawCredentialId[6] & 0x0f) | 0x40;
-  rawCredentialId[8] = (rawCredentialId[8] & 0x3f) | 0x80;
-  const credentialUuid = bytesToUuid(rawCredentialId);
-
-  const authData = buildAuthenticatorData({
-    rpId,
-    counter: 0,
-    userPresent: true,
-    userVerified: Boolean(userVerified),
-    attestedCredential: { rawCredentialId, cosePublicKey },
-  });
-  const attestationObject = encodeNoneAttestationObject(authData);
-
-  const clientDataJSONStr = JSON.stringify({
-    type: "webauthn.create",
-    challenge: params.challenge,
-    origin,
-    crossOrigin: false,
-  });
-  const clientDataJSONBytes = Buffer.from(clientDataJSONStr, "utf8");
-
-  const extensions = {};
-  if (params.extensions?.credProps) {
-    extensions.credProps = { rk: discoverable };
-  }
-
-  const record = {
-    credentialId: credentialUuid,
-    rawId: rawCredentialId,
-    keyType: "public-key",
-    keyAlgorithm: "ECDSA",
-    keyCurve: "P-256",
-    keyValue: toBase64Url(pkcs8Der),
-    rpId,
-    rpName: params.rp?.name || rpId,
-    userHandle: toBase64Url(userIdBytes),
-    userName: params.user?.name || "",
-    userDisplayName: params.user?.displayName || params.user?.name || "",
-    counter: 0,
-    discoverable,
-    creationDate: new Date().toISOString(),
-  };
-
-  return {
-    credential: {
-      credentialId: toBase64Url(rawCredentialId),
-      attestationObject: toBase64Url(attestationObject),
-      authData: toBase64Url(authData),
-      clientDataJSON: toBase64Url(clientDataJSONBytes),
-      publicKey: toBase64Url(spkiDer),
-      publicKeyAlgorithm: -7,
-      transports: ["internal", "hybrid"],
-      extensions,
-    },
-    record,
-  };
-}
-
-let lastMonotonicCounter = 0;
-
-function nextReadOnlyMonotonicCounter(storedCounter) {
-  const epochSec = Math.floor(Date.now() / 1000);
-  const candidate = Math.max(storedCounter + 1, epochSec, lastMonotonicCounter + 1);
-  lastMonotonicCounter = candidate;
-  return candidate >>> 0;
-}
-
-export function assertPasskeyCredential(params, context = {}) {
-  const {
-    existingRecords = [],
-    selectedCredentialId = null,
-    neverDomains = null,
-    passkeysEnabled = true,
-    userVerified = true,
-    readOnlyVault = false,
-    abortSignal = null,
-  } = context;
-
-  checkAborted(abortSignal);
-
-  if (!passkeysEnabled) {
-    throw new FallbackRequestedError();
-  }
-
-  const { origin, hostname, rpId } = resolveOriginAndRpId(params.origin, params.rpId);
-  if (neverDomains?.has?.(hostname)) {
-    throw new FallbackRequestedError();
-  }
-
-  const allowed = Array.isArray(params.allowedCredentials) ? params.allowedCredentials : [];
-  if (isHardwareOnlyAllowList(allowed)) {
-    throw new FallbackRequestedError();
-  }
-
-  const requireUv = resolveUserVerificationRequirement(params.userVerification);
-
-  const candidates = findMatchingPasskeys(existingRecords, {
-    rpId,
-    allowedCredentials: allowed,
-  });
-
-  if (candidates.length === 0) {
-    throw new WebAuthnError("NotAllowedError", "No matching passkey found in vault");
-  }
-
-  let selected = candidates[0];
-  if (selectedCredentialId) {
-    const wantedBytes = credentialIdToBytes(selectedCredentialId);
-    selected =
-      candidates.find((c) => {
-        if (c.credentialId === selectedCredentialId || c.cipherId === selectedCredentialId) {
-          return true;
-        }
-        const raw = c.rawId || credentialIdToBytes(c.credentialId);
-        return wantedBytes && raw && wantedBytes.equals(raw);
-      }) || null;
-    if (!selected) {
-      throw new WebAuthnError("NotAllowedError", "Selected passkey not found");
+    const socket = await this.#ensureConnected({ allowLaunch });
+    const remainingMs = deadline - Date.now();
+    if (context && this.#cancelledContexts.has(context)) {
+      throw new WebAuthnError("AbortError", "The operation either timed out or was not allowed.");
     }
+    if (remainingMs <= 0) {
+      throw new WebAuthnError(
+        "NotAllowedError",
+        "The operation either timed out or was not allowed.",
+      );
+    }
+
+    const sequenceNumber = this.#nextSeq++;
+    if (this.#nextSeq > 0x7fff_ff00) {
+      this.#nextSeq = crypto.randomInt(0x1000_0000, 0x7000_0000);
+    }
+
+    const wireObj =
+      params === undefined
+        ? { sequenceNumber, request: requestName }
+        : { sequenceNumber, request: requestName, params };
+
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#pending.delete(sequenceNumber);
+        if (context) {
+          this.#rememberCancelledContext(context);
+          this.#sendCancelFrame(context);
+        }
+        reject(
+          new WebAuthnError("NotAllowedError", "The operation either timed out or was not allowed."),
+        );
+      }, remainingMs);
+
+      this.#pending.set(sequenceNumber, {
+        resolve,
+        reject,
+        timer,
+        context,
+        expectedRpId,
+        expectedHashBuf,
+      });
+      try {
+        writeLengthPrefixedFrame(socket, JSON.stringify(wireObj));
+      } catch (err) {
+        clearTimeout(timer);
+        this.#pending.delete(sequenceNumber);
+        reject(err);
+      }
+    });
   }
 
-  if (!userVerified && (requireUv || selected.reprompt)) {
-    throw new WebAuthnError("NotAllowedError", "User verification required");
+  cancelRequest(context) {
+    if (!context) return;
+    this.#rememberCancelledContext(context);
+    this.#sendCancelFrame(context);
   }
 
-  checkAborted(abortSignal);
+  async assertPasskey(req) {
+    const { origin, rpId } = resolveOriginAndRpId(req.origin, req.rpId);
+    const requestedUv = resolveUserVerificationRequirement(req.userVerification);
+    // Enforce Touch ID / Desktop confirmation even if RP passed "discouraged" so unlocked Desktop never signs silently
+    const userVerification = requestedUv === "discouraged" ? "preferred" : requestedUv;
+    if (isHardwareOnlyAllowList(req.allowedCredentials)) {
+      throw new FallbackRequestedError("Hardware security key requested");
+    }
 
-  const rawId = selected.rawId || credentialIdToBytes(selected.credentialId);
-  const counterUpdated = selected.counter > 0;
-  const nextCounter = counterUpdated
-    ? readOnlyVault
-      ? nextReadOnlyMonotonicCounter(selected.counter)
-      : selected.counter + 1
-    : 0;
+    const rawAllow = Array.isArray(req.allowedCredentials) ? req.allowedCredentials : [];
+    const allowedCredentials = [];
+    for (const item of rawAllow) {
+      if (item?.type !== "public-key" || typeof item.id !== "string") continue;
+      allowedCredentials.push(Array.from(fromBase64Url(item.id)));
+    }
+    if (rawAllow.length > 0 && allowedCredentials.length === 0) {
+      throw new FallbackRequestedError("No supported public-key descriptors in allowCredentials");
+    }
 
-  const authenticatorData = buildAuthenticatorData({
-    rpId: selected.rpId,
-    counter: nextCounter,
-    userPresent: true,
-    userVerified: Boolean(userVerified),
-  });
-
-  const clientDataJSONStr = JSON.stringify({
-    type: "webauthn.get",
-    challenge: params.challenge,
-    origin,
-    crossOrigin: !params.sameOriginWithAncestors,
-  });
-  const clientDataJSONBytes = Buffer.from(clientDataJSONStr, "utf8");
-  const clientDataHash = crypto.createHash("sha256").update(clientDataJSONBytes).digest();
-
-  const keyDer = fromBase64Url(selected.keyValue);
-  try {
-    const privateKey = crypto.createPrivateKey({
-      key: keyDer,
-      format: "der",
-      type: "pkcs8",
+    const { clientDataJSON, clientDataHash, clientDataHashBuf } = buildClientDataAndHash({
+      type: "webauthn.get",
+      challenge: req.challenge,
+      origin,
+      crossOrigin: !req.sameOriginWithAncestors,
+      topOrigin: req.topOrigin,
     });
-    const signatureDer = crypto.sign("sha256", Buffer.concat([authenticatorData, clientDataHash]), {
-      key: privateKey,
-      dsaEncoding: "der",
-    });
+
+    const position = normalizeWindowPosition(req.windowXy);
+    const context = typeof req.context === "string" && req.context ? req.context : crypto.randomUUID();
+    const timeoutMs = clampWebAuthnTimeout(req.timeout);
+
+    const res = await this.#sendRequest(
+      "passkeyAssertion",
+      {
+        rpId,
+        clientDataHash,
+        userVerification,
+        clientWindow: { position, handle: null },
+        allowedCredentials,
+        context,
+      },
+      timeoutMs,
+      { allowLaunch: true, context, expectedRpId: rpId, expectedHashBuf: clientDataHashBuf },
+    );
 
     return {
+      rpId,
       assertion: {
-        credentialId: toBase64Url(rawId),
-        authenticatorData: toBase64Url(authenticatorData),
-        clientDataJSON: toBase64Url(clientDataJSONBytes),
-        signature: toBase64Url(signatureDer),
-        userHandle: selected.userHandle || "",
+        credentialId: toBase64Url(Buffer.from(res.credentialId)),
+        clientDataJSON,
+        authenticatorData: toBase64Url(Buffer.from(res.authenticatorData)),
+        signature: toBase64Url(Buffer.from(res.signature)),
+        userHandle:
+          Array.isArray(res.userHandle) && res.userHandle.length > 0
+            ? toBase64Url(Buffer.from(res.userHandle))
+            : null,
       },
-      selectedRecord: selected,
-      nextCounter,
-      counterUpdated,
     };
-  } finally {
-    keyDer.fill(0);
   }
+
+  async registerPasskey(req) {
+    const { origin, rpId } = resolveOriginAndRpId(req.origin, req.rpId);
+    const requestedUv = resolveUserVerificationRequirement(req.userVerification);
+    // Upgrade "discouraged" to "preferred" so unlocked Desktop always prompts Touch ID instead of creating passkeys silently
+    const userVerification = requestedUv === "discouraged" ? "preferred" : requestedUv;
+
+    if (req.authenticatorAttachment === "cross-platform") {
+      throw new FallbackRequestedError("Cross-platform authenticator attachment requested");
+    }
+
+    let supportedAlgorithms = [ES256_ALG, RS256_ALG];
+    if (Array.isArray(req.pubKeyCredParams) && req.pubKeyCredParams.length > 0) {
+      const validAlgs = req.pubKeyCredParams
+        .filter((p) => p?.type === "public-key" && Number.isInteger(p.alg))
+        .map((p) => p.alg);
+      if (validAlgs.length === 0) {
+        throw new WebAuthnError(
+          "NotSupportedError",
+          "None of the requested pubKeyCredParams are supported",
+        );
+      }
+      if (!validAlgs.includes(ES256_ALG)) {
+        if (req.fallbackSupported) {
+          throw new FallbackRequestedError("ES256 not in pubKeyCredParams");
+        }
+        throw new WebAuthnError("NotSupportedError", "Authenticator requires ES256 (-7)");
+      }
+      supportedAlgorithms = validAlgs;
+    }
+
+    if (typeof req.userName !== "string" || !req.userName) {
+      throw new TypeError("Missing user.name");
+    }
+    if (typeof req.userId !== "string" || !req.userId) {
+      throw new TypeError("Missing user.id");
+    }
+    const userHandleBytes = fromBase64Url(req.userId);
+    if (userHandleBytes.length < 1 || userHandleBytes.length > 64) {
+      throw new TypeError("user.id must be between 1 and 64 bytes");
+    }
+
+    const excludedCredentials = [];
+    if (Array.isArray(req.excludeCredentials)) {
+      for (const item of req.excludeCredentials) {
+        if (item?.type === "public-key" && typeof item.id === "string") {
+          excludedCredentials.push(Array.from(fromBase64Url(item.id)));
+        }
+      }
+    }
+
+    const { clientDataJSON, clientDataHash, clientDataHashBuf } = buildClientDataAndHash({
+      type: "webauthn.create",
+      challenge: req.challenge,
+      origin,
+      crossOrigin: !req.sameOriginWithAncestors,
+      topOrigin: req.topOrigin,
+    });
+
+    const position = normalizeWindowPosition(req.windowXy);
+    const context = typeof req.context === "string" && req.context ? req.context : crypto.randomUUID();
+    const timeoutMs = clampWebAuthnTimeout(req.timeout);
+
+    const res = await this.#sendRequest(
+      "passkeyRegistration",
+      {
+        rpId,
+        clientDataHash,
+        userVerification,
+        clientWindow: { position, handle: null },
+        userName: req.userName,
+        userHandle: Array.from(userHandleBytes),
+        supportedAlgorithms,
+        excludedCredentials,
+        context,
+      },
+      timeoutMs,
+      { allowLaunch: true, context, expectedRpId: rpId, expectedHashBuf: clientDataHashBuf },
+    );
+
+    const attestationBuf = Buffer.from(res.attestationObject);
+    const meta = extractAttestationMetadata(attestationBuf);
+
+    return {
+      rpId,
+      registration: {
+        credentialId: toBase64Url(Buffer.from(res.credentialId)),
+        clientDataJSON,
+        attestationObject: toBase64Url(attestationBuf),
+        authenticatorData: meta.authenticatorData,
+        publicKey: meta.publicKey,
+        publicKeyAlgorithm: meta.publicKeyAlgorithm,
+        transports: ["internal", "hybrid"],
+      },
+    };
+  }
+}
+
+function normalizeWindowPosition(windowXy) {
+  const x = Number.isFinite(windowXy?.x) ? Math.round(windowXy.x) : 640;
+  const y = Number.isFinite(windowXy?.y) ? Math.round(windowXy.y) : 360;
+  return { x, y };
+}
+
+function clampWebAuthnTimeout(timeout) {
+  const n = Number(timeout);
+  if (!Number.isFinite(n) || n <= 0) return 120_000;
+  return Math.min(Math.max(Math.round(n), 5_000), 300_000);
 }

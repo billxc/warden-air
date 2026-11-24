@@ -37,7 +37,7 @@
   });
 
   async function handleRequest(type, rawPayload, requestId, abortSignal) {
-    if (type !== "get") {
+    if (type !== "get" && type !== "create") {
       return rawPayload?.fallbackSupported
         ? { ok: false, fallbackRequested: true }
         : {
@@ -46,20 +46,51 @@
           };
     }
 
-    if (!isPolicyFeatureAllowed("publickey-credentials-get")) {
+    const policyFeature =
+      type === "get" ? "publickey-credentials-get" : "publickey-credentials-create";
+    if (!isPolicyFeatureAllowed(policyFeature)) {
       return {
         ok: false,
         error: {
           name: "NotAllowedError",
-          message: "The 'publickey-credentials-get' feature is not enabled in this document.",
+          message: `The '${policyFeature}' feature is not enabled in this document.`,
         },
       };
+    }
+
+    // Cross-origin iframes cannot invoke create() per W3C WebAuthn §5.1.3
+    let sameOriginWithAncestors = window.self === window.top;
+    if (!sameOriginWithAncestors) {
+      try {
+        let cur = window;
+        sameOriginWithAncestors = true;
+        while (cur !== window.top) {
+          if (cur.parent.location.origin !== window.location.origin) {
+            sameOriginWithAncestors = false;
+            break;
+          }
+          cur = cur.parent;
+        }
+      } catch {
+        sameOriginWithAncestors = false;
+      }
+    }
+    if (type === "create" && !sameOriginWithAncestors) {
+      return rawPayload?.fallbackSupported
+        ? { ok: false, fallbackRequested: true }
+        : {
+            ok: false,
+            error: {
+              name: "NotAllowedError",
+              message: "Credential creation is not allowed in cross-origin frames.",
+            },
+          };
     }
 
     const data = {
       ...rawPayload,
       origin: window.location.origin,
-      sameOriginWithAncestors: window.self === window.top,
+      sameOriginWithAncestors,
     };
 
     activeRequestIds.add(requestId);
@@ -68,7 +99,7 @@
 
     try {
       const reply = await chrome.runtime
-        .sendMessage({ type: "passkey-get-request", requestId, data })
+        .sendMessage({ type: "passkey-request", op: type, requestId, data })
         .catch(() => null);
 
       if (abortSignal.aborted) {
@@ -107,7 +138,10 @@
     }
 
     const port = event.ports[0];
-    const requestId = `${Date.now()}_${++seq}`;
+    const requestId =
+      typeof globalThis.crypto?.randomUUID === "function"
+        ? globalThis.crypto.randomUUID()
+        : `${Date.now()}_${++seq}`;
     const abortController = new AbortController();
 
     port.onmessage = (portEvent) => {

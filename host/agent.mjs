@@ -15,9 +15,9 @@ import {
   setStoredDesktopSharedKey,
 } from "./paths.mjs";
 import {
+  AutofillIpcClient,
   FallbackRequestedError,
   WebAuthnError,
-  assertPasskeyCredential,
   isHardwareOnlyAllowList,
   resolveOriginAndRpId,
   resolveUserVerificationRequirement,
@@ -28,7 +28,6 @@ import {
   encryptSymEncString,
   hasAnyPasskeyInLocalStore,
   isAutofillEligibleUrl,
-  queryLocalPasskeysForRpId,
   queryLocalVaultForUrl,
   readAccountsFromLocalStore,
   resolveBitwardenDataFile,
@@ -643,6 +642,9 @@ function isSafeDesktopUpdateTarget(cipher, ciphersMap, defaultMatch) {
 }
 
 const bridge = new DesktopBiometricBridge();
+const autofillIpc = new AutofillIpcClient({
+  launchDesktop: focusOrLaunchBitwardenDesktop,
+});
 
 function getStatusSnapshot() {
   const { accounts } = readAccountsFromLocalStore();
@@ -654,17 +656,6 @@ function getStatusSnapshot() {
   return { accounts: enriched, active };
 }
 
-function toPasskeyCandidateSummary(rec) {
-  return {
-    credentialId: rec.credentialId,
-    cipherId: rec.cipherId,
-    rpId: rec.rpId,
-    rpName: rec.rpName,
-    userName: rec.userName,
-    userDisplayName: rec.userDisplayName,
-  };
-}
-
 function formatPasskeyError(id, err) {
   if (err instanceof FallbackRequestedError || err?.fallbackRequested) {
     return { id, ok: false, fallbackRequested: true };
@@ -673,9 +664,6 @@ function formatPasskeyError(id, err) {
     return { id, ok: false, error: err.name, message: err.message };
   }
   const msg = err instanceof Error ? err.message : String(err);
-  if (msg === "biometric_canceled_or_disabled" || msg === "biometric_timeout") {
-    return { id, ok: false, retryable: true, error: "NotAllowedError", message: msg };
-  }
   return { id, ok: false, error: "NotAllowedError", message: msg };
 }
 
@@ -761,7 +749,7 @@ async function handleAction(req) {
         return { id, ok: true, ...result };
       }
 
-      case "passkeyQuery": {
+      case "passkeyAssert": {
         try {
           const { rpId } = resolveOriginAndRpId(req.origin, req.rpId);
           resolveUserVerificationRequirement(req.userVerification);
@@ -774,99 +762,39 @@ async function handleAction(req) {
             return { id, ok: false, fallbackRequested: true };
           }
 
-          const userKey = peekUnlockedKey(active.id);
-          if (!userKey) {
-            const mayHavePasskey = vaultUriCache.isInitialized(active.id)
-              ? vaultUriCache.hasPasskeyRpId(active.id, rpId)
-              : hasAnyPasskeyInLocalStore(active.id);
-            if (!mayHavePasskey) {
-              return { id, ok: false, fallbackRequested: true };
-            }
-            return { id, ok: false, error: "locked", email: active.email };
-          }
-
-          const records = queryLocalPasskeysForRpId(
-            active.id,
-            userKey,
-            rpId,
-            req.allowedCredentials || [],
-          );
-          if (records.length === 0) {
+          const mayHavePasskey = vaultUriCache.isInitialized(active.id)
+            ? vaultUriCache.hasPasskeyRpId(active.id, rpId)
+            : vaultUriCache.hasPasskeyRpId(active.id, rpId) ||
+              hasAnyPasskeyInLocalStore(active.id);
+          if (!mayHavePasskey) {
             return { id, ok: false, fallbackRequested: true };
           }
-          return {
-            id,
-            ok: true,
-            email: active.email,
-            candidates: records.map(toPasskeyCandidateSummary),
-          };
+
+          const asserted = await autofillIpc.assertPasskey(req);
+          return { id, ok: true, email: active.email, result: asserted.assertion };
         } catch (err) {
           return formatPasskeyError(id, err);
         }
       }
 
-      case "passkeyAssert": {
+      case "passkeyRegister": {
         try {
-          const { origin, rpId } = resolveOriginAndRpId(req.origin, req.rpId);
-          resolveUserVerificationRequirement(req.userVerification);
-          if (isHardwareOnlyAllowList(req.allowedCredentials)) {
-            return { id, ok: false, fallbackRequested: true };
-          }
-
           const { active } = getStatusSnapshot();
           if (!active) {
             return { id, ok: false, fallbackRequested: true };
           }
 
-          let userKey = peekUnlockedKey(active.id);
-          if (!userKey) {
-            userKey = await bridge.unlockWithTouchId(active.id);
-          }
-
-          const records = queryLocalPasskeysForRpId(
-            active.id,
-            userKey,
-            rpId,
-            req.allowedCredentials || [],
-          );
-          if (records.length === 0) {
-            wipeAllKeys();
-            return { id, ok: false, fallbackRequested: true };
-          }
-
-          if (!req.selectedCredentialId && records.length > 1) {
-            return {
-              id,
-              ok: true,
-              email: active.email,
-              candidates: records.map(toPasskeyCandidateSummary),
-            };
-          }
-
-          try {
-            const asserted = assertPasskeyCredential(
-              {
-                origin,
-                rpId,
-                challenge: req.challenge,
-                sameOriginWithAncestors: Boolean(req.sameOriginWithAncestors),
-                allowedCredentials: req.allowedCredentials || [],
-                userVerification: req.userVerification,
-              },
-              {
-                existingRecords: records,
-                selectedCredentialId: req.selectedCredentialId || null,
-                userVerified: true,
-                readOnlyVault: true,
-              },
-            );
-            return { id, ok: true, email: active.email, result: asserted.assertion };
-          } finally {
-            wipeAllKeys();
-          }
+          const registered = await autofillIpc.registerPasskey(req);
+          vaultUriCache.recordSavedPasskeyRpId(active.id, registered.rpId);
+          return { id, ok: true, email: active.email, result: registered.registration };
         } catch (err) {
           return formatPasskeyError(id, err);
         }
+      }
+
+      case "passkeyCancel": {
+        autofillIpc.cancelRequest(req.context);
+        return { id, ok: true };
       }
 
       default:
@@ -895,7 +823,15 @@ fs.mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
 
 let ownsSocket = false;
 
-const IMMEDIATE_ACTIONS = new Set(["ping", "status", "lock", "shutdown"]);
+const IMMEDIATE_ACTIONS = new Set([
+  "ping",
+  "status",
+  "lock",
+  "shutdown",
+  "passkeyAssert",
+  "passkeyRegister",
+  "passkeyCancel",
+]);
 
 function createAgentServer() {
   const srv = net.createServer((socket) => {
@@ -970,6 +906,7 @@ try {
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     wipeAllKeys();
+    autofillIpc.close();
     if (ownsSocket && !IS_WIN) {
       try {
         fs.unlinkSync(SOCKET_PATH);

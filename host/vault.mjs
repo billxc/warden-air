@@ -3,8 +3,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { decryptPasskeyRecord, findMatchingPasskeys } from "./passkey.mjs";
-
 export function resolveBitwardenDataFile() {
   if (process.env.BW_DATA_FILE) return process.env.BW_DATA_FILE;
   const candidate =
@@ -552,65 +550,6 @@ export function hasAnyPasskeyInLocalStore(userId, dataFileResolver = resolveBitw
   }
 }
 
-export function queryLocalPasskeysForRpId(userId, userKeyBuf, rpId, allowedCredentials = []) {
-  if (!userId || !userKeyBuf || !rpId) return [];
-
-  const dataFile = resolveBitwardenDataFile();
-  if (!dataFile) return [];
-
-  const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
-  const ciphersMap = store[`user_${userId}_ciphers_ciphers`] || {};
-  const localDataMap = store[`user_${userId}_ciphersLocal_localData`] || {};
-  const orgKeys = createOrgKeyResolver(store, userId, userKeyBuf);
-
-  const decryptedRecords = [];
-
-  try {
-    for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
-      if (!isEligiblePasskeyCipher(cipher)) continue;
-
-      const baseKey = cipher.organizationId ? orgKeys.getOrgKey(cipher.organizationId) : userKeyBuf;
-      if (!baseKey) continue;
-
-      let itemKey = baseKey;
-      let ownsItemKey = false;
-      if (cipher.key) {
-        try {
-          itemKey = decryptSymBytes(cipher.key, baseKey);
-          ownsItemKey = Boolean(itemKey);
-        } catch {
-          continue;
-        }
-      }
-      if (!itemKey) continue;
-
-      try {
-        const lastUsedDate = Number(localDataMap[cipherId]?.lastUsedDate) || 0;
-        const dec = (encField) => decryptSymString(encField, itemKey);
-        for (const rawFido2 of cipher.login.fido2Credentials) {
-          try {
-            const rec = decryptPasskeyRecord(rawFido2, dec, {
-              cipherId,
-              organizationId: cipher.organizationId || null,
-              reprompt: cipher.reprompt || 0,
-              lastUsedDate,
-            });
-            if (rec) {
-              decryptedRecords.push(rec);
-            }
-          } catch {}
-        }
-      } finally {
-        if (ownsItemKey) itemKey.fill(0);
-      }
-    }
-  } finally {
-    orgKeys.wipe();
-  }
-
-  return findMatchingPasskeys(decryptedRecords, { rpId, allowedCredentials });
-}
-
 export class VaultUriCache {
   #byUser = new Map();
   #resolveDataFile;
@@ -631,6 +570,7 @@ export class VaultUriCache {
 
     const cipherRules = new Map();
     const passkeyRpIds = new Map();
+    const indexedPasskeyRevisions = new Map();
 
     try {
       for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
@@ -672,6 +612,7 @@ export class VaultUriCache {
           }
 
           if (hasPk) {
+            indexedPasskeyRevisions.set(cipherId, cipher.revisionDate || "");
             const rpIds = [];
             for (const rawFido2 of cipher.login.fido2Credentials) {
               if (!rawFido2?.rpId) continue;
@@ -697,6 +638,9 @@ export class VaultUriCache {
     this.#byUser.set(userId, {
       cipherRules,
       passkeyRpIds,
+      indexedPasskeyRevisions,
+      hasUnindexedPasskey: false,
+      savedPasskeyRpIds: new Set(),
       savedRules: new Map(),
       initialized: true,
       lastMtimeMs: mtimeMs,
@@ -710,6 +654,7 @@ export class VaultUriCache {
       state = {
         cipherRules: new Map(),
         passkeyRpIds: new Map(),
+        savedPasskeyRpIds: new Set(),
         savedRules: new Map(),
         initialized: false,
         lastMtimeMs: -1,
@@ -727,12 +672,30 @@ export class VaultUriCache {
     state.savedRules.set(rawUri, { uri: rawUri, match: defaultMatch });
   }
 
+  recordSavedPasskeyRpId(userId, rpId) {
+    if (!userId || !rpId) return;
+    let state = this.#byUser.get(userId);
+    if (!state) {
+      state = {
+        cipherRules: new Map(),
+        passkeyRpIds: new Map(),
+        savedPasskeyRpIds: new Set(),
+        savedRules: new Map(),
+        initialized: false,
+        lastMtimeMs: -1,
+      };
+      this.#byUser.set(userId, state);
+    }
+    state.savedPasskeyRpIds.add(String(rpId).toLowerCase());
+  }
+
   #pruneStaleCiphers(userId, state) {
-    if (state.cipherRules.size === 0 && state.passkeyRpIds.size === 0) return;
+    if (!state.initialized) return;
     const dataFile = this.#resolveDataFile();
     if (!dataFile) {
       state.cipherRules.clear();
       state.passkeyRpIds.clear();
+      state.hasUnindexedPasskey = false;
       return;
     }
     let mtimeMs;
@@ -754,8 +717,18 @@ export class VaultUriCache {
       for (const cipherId of state.passkeyRpIds.keys()) {
         if (!isEligiblePasskeyCipher(ciphersMap[cipherId])) {
           state.passkeyRpIds.delete(cipherId);
+          state.indexedPasskeyRevisions?.delete(cipherId);
         }
       }
+      let unindexed = false;
+      for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
+        if (!isEligiblePasskeyCipher(cipher)) continue;
+        if (state.indexedPasskeyRevisions?.get(cipherId) !== (cipher.revisionDate || "")) {
+          unindexed = true;
+          break;
+        }
+      }
+      state.hasUnindexedPasskey = unindexed;
       state.lastMtimeMs = mtimeMs;
     } catch {}
   }
@@ -767,11 +740,19 @@ export class VaultUriCache {
   hasPasskeyRpId(userId, rpId) {
     if (!userId || !rpId) return false;
     const state = this.#byUser.get(userId);
-    if (!state || !state.initialized) return false;
-
-    this.#pruneStaleCiphers(userId, state);
+    if (!state) return false;
 
     const target = String(rpId).toLowerCase();
+    if (state.savedPasskeyRpIds?.has(target)) {
+      return true;
+    }
+    if (!state.initialized) return false;
+
+    this.#pruneStaleCiphers(userId, state);
+    if (state.hasUnindexedPasskey) {
+      return true;
+    }
+
     for (const rpIds of state.passkeyRpIds.values()) {
       if (rpIds.includes(target)) {
         return true;
