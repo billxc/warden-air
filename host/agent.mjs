@@ -545,6 +545,7 @@ class DesktopBiometricBridge {
       const chosen = list.find(
         (c) =>
           c.credentialId === updateCredentialId &&
+          (c.userName ?? "") === username &&
           isSafeDesktopUpdateTarget(c, ciphersMap, defaultMatch),
       );
       if (!chosen) {

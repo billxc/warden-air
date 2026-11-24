@@ -76,7 +76,7 @@ let port = null;
 let nextId = 1;
 const pending = new Map();
 // In-memory per-tab captured credentials:
-// tabId -> { captureId, uri, origin, host, hostname, frameId, username, password, updatedAt, timer, expiryTimer }
+// tabId -> { captureId, uri, origin, host, hostname, frameId, senderWindowId, windowId, openingWindow, username, password, updatedAt, timer, retryTimer, expiryTimer }
 const pendingSaves = new Map();
 
 function claimPasswordManager() {
@@ -89,20 +89,33 @@ chrome.runtime.onInstalled.addListener(claimPasswordManager);
 chrome.runtime.onStartup.addListener(claimPasswordManager);
 claimPasswordManager();
 
-function clearPendingSave(tabId) {
+function clearPendingSave(tabId, { closeWindow = true } = {}) {
   const entry = pendingSaves.get(tabId);
-  if (entry?.timer) clearTimeout(entry.timer);
-  if (entry?.expiryTimer) clearTimeout(entry.expiryTimer);
-  if (entry) entry.password = "";
+  if (!entry) return;
+  if (entry.timer) clearTimeout(entry.timer);
+  if (entry.retryTimer) clearTimeout(entry.retryTimer);
+  if (entry.expiryTimer) clearTimeout(entry.expiryTimer);
+  const winToClose = entry.windowId;
+  entry.windowId = null;
+  entry.password = "";
   pendingSaves.delete(tabId);
+  if (closeWindow && winToClose != null) {
+    chrome.windows.remove(winToClose).catch(() => {});
+  }
 }
 
 function storePendingSave(tabId, record) {
-  clearPendingSave(tabId);
+  const prevWindowId = pendingSaves.get(tabId)?.windowId ?? null;
+  clearPendingSave(tabId, { closeWindow: !record.password });
   const expiryTimer = setTimeout(() => {
     clearPendingSave(tabId);
   }, PENDING_SAVE_TTL_MS);
-  pendingSaves.set(tabId, { ...record, expiryTimer });
+  pendingSaves.set(tabId, {
+    ...record,
+    windowId: record.password ? prevWindowId : null,
+    openingWindow: false,
+    expiryTimer,
+  });
 }
 
 function getFreshPendingSave(tabId) {
@@ -152,6 +165,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {
+  for (const [tabId, entry] of pendingSaves) {
+    if (entry.windowId === windowId) {
+      entry.windowId = null;
+      clearPendingSave(tabId, { closeWindow: false });
+    }
+  }
   for (const [, session] of passkeySessions) {
     if (session.windowId === windowId) {
       session.windowId = null;
@@ -228,6 +247,21 @@ function isTrustedPasskeyPrompt(sender, session) {
   return true;
 }
 
+function isTrustedSavePrompt(sender, entry) {
+  const promptPrefix = chrome.runtime.getURL("save-prompt.html");
+  if (sender.id !== chrome.runtime.id) return false;
+  if (typeof sender.url !== "string" || !sender.url.startsWith(promptPrefix)) return false;
+  if (sender.frameId != null && sender.frameId !== 0) return false;
+  if (
+    entry?.windowId != null &&
+    sender.tab?.windowId != null &&
+    sender.tab.windowId !== entry.windowId
+  ) {
+    return false;
+  }
+  return true;
+}
+
 async function flashBadge(tabId, text, color) {
   await chrome.action.setBadgeBackgroundColor({ tabId, color });
   await chrome.action.setBadgeText({ tabId, text });
@@ -296,17 +330,12 @@ function normalizeHostPasskeyReply(res) {
   };
 }
 
-async function openPasskeyPopoutWindow(senderWindowId, sessionId, candidateCount = 0) {
-  const url = chrome.runtime.getURL(
-    `passkey-prompt.html?sessionId=${encodeURIComponent(sessionId)}`,
-  );
-  const height =
-    candidateCount > 0 ? Math.min(380, 175 + candidateCount * 52) : 205;
+async function openTopRightPopoutWindow(senderWindowId, url, width, height) {
   const baseCreate = {
     url,
     type: "popup",
     focused: true,
-    width: PASSKEY_POPOUT_WIDTH,
+    width,
     height,
   };
 
@@ -318,7 +347,7 @@ async function openPasskeyPopoutWindow(senderWindowId, sessionId, candidateCount
         typeof hostWin?.top === "number" &&
         typeof hostWin?.width === "number"
       ) {
-        const left = Math.round(hostWin.left + hostWin.width - PASSKEY_POPOUT_WIDTH - 16);
+        const left = Math.round(hostWin.left + hostWin.width - width - 16);
         const top = Math.round(hostWin.top + 82);
         return await chrome.windows.create({ ...baseCreate, left, top });
       }
@@ -328,6 +357,104 @@ async function openPasskeyPopoutWindow(senderWindowId, sessionId, candidateCount
   }
 
   return await chrome.windows.create(baseCreate);
+}
+
+async function openPasskeyPopoutWindow(senderWindowId, sessionId, candidateCount = 0) {
+  const url = chrome.runtime.getURL(
+    `passkey-prompt.html?sessionId=${encodeURIComponent(sessionId)}`,
+  );
+  const height =
+    candidateCount > 0 ? Math.min(380, 175 + candidateCount * 52) : 205;
+  return await openTopRightPopoutWindow(senderWindowId, url, PASSKEY_POPOUT_WIDTH, height);
+}
+
+async function openOrFocusSavePromptWindow(tabId, senderWindowId) {
+  const entry = getFreshPendingSave(tabId);
+  if (!entry || !entry.password) return;
+
+  if (entry.timer) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+  if (entry.retryTimer) {
+    clearTimeout(entry.retryTimer);
+    entry.retryTimer = null;
+  }
+
+  if (entry.windowId != null) {
+    try {
+      await chrome.windows.get(entry.windowId);
+      entry.promptedCaptureId = entry.captureId;
+      await chrome.runtime
+        .sendMessage({
+          type: "save-prompt-refresh",
+          tabId,
+          captureId: entry.captureId,
+          host: entry.host,
+          username: entry.username,
+        })
+        .catch(() => {});
+      await chrome.windows.update(entry.windowId, { focused: true }).catch(() => {});
+      return;
+    } catch {
+      entry.windowId = null;
+    }
+  }
+
+  if (entry.openingWindow) return;
+  entry.openingWindow = true;
+  const targetCaptureId = entry.captureId;
+  const url = chrome.runtime.getURL(
+    `save-prompt.html?tabId=${encodeURIComponent(tabId)}&captureId=${encodeURIComponent(targetCaptureId)}`,
+  );
+
+  try {
+    const win = await openTopRightPopoutWindow(
+      senderWindowId ?? entry.senderWindowId,
+      url,
+      PASSKEY_POPOUT_WIDTH,
+      235,
+    );
+    const cur = pendingSaves.get(tabId);
+    if (!cur || cur.captureId !== targetCaptureId) {
+      if (win?.id != null) {
+        chrome.windows.remove(win.id).catch(() => {});
+      }
+      return;
+    }
+    cur.windowId = win?.id ?? null;
+    cur.promptedCaptureId = targetCaptureId;
+    cur.openingWindow = false;
+  } catch {
+    const cur = pendingSaves.get(tabId);
+    if (cur && cur.captureId === targetCaptureId) {
+      cur.openingWindow = false;
+    }
+  }
+}
+
+async function tryTriggerSpaSavePrompt(tabId, captureId, allowRetry) {
+  const cur = getFreshPendingSave(tabId);
+  if (!cur || cur.captureId !== captureId || !cur.password) return;
+  if (cur.openingWindow || cur.promptedCaptureId === captureId) return;
+
+  const probe = await chrome.tabs
+    .sendMessage(tabId, { type: "warden-check-spa-settled" }, { frameId: 0 })
+    .catch(() => null);
+
+  const afterProbe = getFreshPendingSave(tabId);
+  if (!afterProbe || afterProbe.captureId !== captureId || !afterProbe.password) return;
+
+  if (probe?.ok && !probe.settled) {
+    if (allowRetry) {
+      afterProbe.retryTimer = setTimeout(() => {
+        tryTriggerSpaSavePrompt(tabId, captureId, false);
+      }, 2000);
+    }
+    return;
+  }
+
+  await openOrFocusSavePromptWindow(tabId, afterProbe.senderWindowId);
 }
 
 async function handlePasskeyGetWithPopout(sender, requestId, rawData) {
@@ -574,6 +701,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       case "content-capture-submit": {
         const tabId = sender.tab?.id;
+        const senderWindowId = sender.tab?.windowId ?? null;
         const frameId = sender.frameId ?? 0;
         const frameUrl = sender.url;
         if (!tabId || !frameUrl || !/^https?:/i.test(frameUrl)) {
@@ -604,10 +732,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             host: url.host,
             hostname: url.hostname,
             frameId,
+            senderWindowId,
             username,
             password: "",
             updatedAt: Date.now(),
             timer: null,
+            retryTimer: null,
           });
           return { ok: true, partial: true };
         }
@@ -623,21 +753,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const captureId = crypto.randomUUID();
 
         const timer = setTimeout(() => {
-          const cur = getFreshPendingSave(tabId);
-          if (!cur || cur.captureId !== captureId || !cur.password) return;
-          chrome.tabs
-            .sendMessage(
-              tabId,
-              {
-                type: "warden-show-save-bar",
-                captureId: cur.captureId,
-                host: cur.host,
-                username: cur.username,
-                spaFallback: true,
-              },
-              { frameId: 0 },
-            )
-            .catch(() => {});
+          tryTriggerSpaSavePrompt(tabId, captureId, true);
         }, SPA_PROMPT_DELAY_MS);
 
         storePendingSave(tabId, {
@@ -647,10 +763,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           host: url.host,
           hostname: url.hostname,
           frameId,
+          senderWindowId,
           username: mergedUsername,
           password,
           updatedAt: Date.now(),
           timer,
+          retryTimer: null,
         });
         return { ok: true, captureId };
       }
@@ -658,39 +776,49 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "content-check-pending-save": {
         const tabId = sender.tab?.id;
         if (!tabId || sender.frameId !== 0 || !sender.url || !/^https?:/i.test(sender.url)) {
-          return { ok: true, pending: null };
+          return { ok: true };
         }
         const entry = getFreshPendingSave(tabId);
         if (!entry || !entry.password) {
-          return { ok: true, pending: null };
+          return { ok: true };
         }
         const topUrl = new URL(sender.url);
         const sameSite = getBaseDomain(topUrl.hostname) === getBaseDomain(entry.hostname);
         const recentRedirect = Date.now() - entry.updatedAt <= CROSS_ORIGIN_REDIRECT_WINDOW_MS;
         if (!sameSite && !recentRedirect) {
           clearPendingSave(tabId);
-          return { ok: true, pending: null };
+          return { ok: true };
         }
-        if (entry.timer) {
-          clearTimeout(entry.timer);
-          entry.timer = null;
+        await openOrFocusSavePromptWindow(tabId, sender.tab.windowId ?? entry.senderWindowId);
+        return { ok: true };
+      }
+
+      case "save-prompt-init": {
+        const tabId = Number(msg.tabId || 0);
+        const entry = getFreshPendingSave(tabId);
+        if (!isTrustedSavePrompt(sender, entry)) {
+          return { ok: false, error: "forbidden_sender" };
         }
+        if (!entry || !entry.password || entry.captureId !== msg.captureId) {
+          return { ok: false, error: "expired" };
+        }
+        const statusRes = await callHost("status").catch(() => null);
+        const activeAcc =
+          statusRes?.accounts?.find((a) => a.active) || statusRes?.accounts?.[0] || null;
         return {
           ok: true,
-          pending: {
-            captureId: entry.captureId,
-            host: entry.host,
-            username: entry.username,
-          },
+          host: entry.host,
+          username: entry.username,
+          email: activeAcc?.email || "",
         };
       }
 
-      case "content-confirm-save": {
-        const tabId = sender.tab?.id;
-        if (!tabId || sender.frameId !== 0) {
-          return { ok: false, error: "invalid_frame" };
-        }
+      case "save-prompt-confirm": {
+        const tabId = Number(msg.tabId || 0);
         const entry = getFreshPendingSave(tabId);
+        if (!isTrustedSavePrompt(sender, entry)) {
+          return { ok: false, error: "forbidden_sender" };
+        }
         if (!entry || !entry.password) {
           return { ok: false, error: "expired" };
         }
@@ -713,23 +841,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             clearTimeout(entry.expiryTimer);
             entry.expiryTimer = setTimeout(() => clearPendingSave(tabId), PENDING_SAVE_TTL_MS);
           } else {
-            clearPendingSave(tabId);
+            clearPendingSave(tabId, { closeWindow: false });
           }
         }
         return res;
       }
 
-      case "content-dismiss-save": {
-        const tabId = sender.tab?.id;
-        if (!tabId || sender.frameId !== 0) {
-          return { ok: false, error: "invalid_frame" };
-        }
+      case "save-prompt-dismiss": {
+        const tabId = Number(msg.tabId || 0);
         const entry = pendingSaves.get(tabId);
+        if (!isTrustedSavePrompt(sender, entry)) {
+          return { ok: false, error: "forbidden_sender" };
+        }
         if (!entry || (msg.captureId && msg.captureId !== entry.captureId)) {
           return { ok: true };
         }
         const targetHost = entry.host;
-        clearPendingSave(tabId);
+        clearPendingSave(tabId, { closeWindow: false });
         if (msg.never && targetHost) {
           await addNeverSaveHost(targetHost);
         }
