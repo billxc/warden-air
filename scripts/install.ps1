@@ -17,7 +17,7 @@ if ($Local -and $PSScriptRoot) {
   New-Item -ItemType Directory -Force -Path $HostDir | Out-Null
 
   Write-Host "Downloading Warden Air host from GitHub..."
-  foreach ($File in @("agent.mjs", "host.mjs", "paths.mjs", "vault.mjs", "run-host.cmd")) {
+  foreach ($File in @("agent.mjs", "host.mjs", "paths.mjs", "vault.mjs", "passkey.mjs", "run-host.cmd")) {
     $OutFile = Join-Path $HostDir $File
     Invoke-WebRequest -UseBasicParsing -Uri "$RawBase/host/$File" -OutFile $OutFile
   }

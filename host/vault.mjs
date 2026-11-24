@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { decryptPasskeyRecord, findMatchingPasskeys } from "./passkey.mjs";
+
 export function resolveBitwardenDataFile() {
   if (process.env.BW_DATA_FILE) return process.env.BW_DATA_FILE;
   const candidate =
@@ -526,6 +528,89 @@ function isEligiblePasswordCipher(cipher) {
   );
 }
 
+function isEligiblePasskeyCipher(cipher) {
+  return Boolean(
+    cipher &&
+      cipher.deletedDate == null &&
+      cipher.type === 1 &&
+      !cipher.reprompt &&
+      Array.isArray(cipher.login?.fido2Credentials) &&
+      cipher.login.fido2Credentials.length > 0,
+  );
+}
+
+export function hasAnyPasskeyInLocalStore(userId, dataFileResolver = resolveBitwardenDataFile) {
+  if (!userId) return false;
+  const dataFile = dataFileResolver();
+  if (!dataFile) return false;
+  try {
+    const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+    const ciphersMap = store[`user_${userId}_ciphers_ciphers`] || {};
+    return Object.values(ciphersMap).some(isEligiblePasskeyCipher);
+  } catch {
+    return false;
+  }
+}
+
+export function queryLocalPasskeysForRpId(userId, userKeyBuf, rpId, allowedCredentials = []) {
+  if (!userId || !userKeyBuf || !rpId) return [];
+
+  const dataFile = resolveBitwardenDataFile();
+  if (!dataFile) return [];
+
+  const store = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+  const ciphersMap = store[`user_${userId}_ciphers_ciphers`] || {};
+  const localDataMap = store[`user_${userId}_ciphersLocal_localData`] || {};
+  const orgKeys = createOrgKeyResolver(store, userId, userKeyBuf);
+
+  const decryptedRecords = [];
+
+  try {
+    for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
+      if (!isEligiblePasskeyCipher(cipher)) continue;
+
+      const baseKey = cipher.organizationId ? orgKeys.getOrgKey(cipher.organizationId) : userKeyBuf;
+      if (!baseKey) continue;
+
+      let itemKey = baseKey;
+      let ownsItemKey = false;
+      if (cipher.key) {
+        try {
+          itemKey = decryptSymBytes(cipher.key, baseKey);
+          ownsItemKey = Boolean(itemKey);
+        } catch {
+          continue;
+        }
+      }
+      if (!itemKey) continue;
+
+      try {
+        const lastUsedDate = Number(localDataMap[cipherId]?.lastUsedDate) || 0;
+        const dec = (encField) => decryptSymString(encField, itemKey);
+        for (const rawFido2 of cipher.login.fido2Credentials) {
+          try {
+            const rec = decryptPasskeyRecord(rawFido2, dec, {
+              cipherId,
+              organizationId: cipher.organizationId || null,
+              reprompt: cipher.reprompt || 0,
+              lastUsedDate,
+            });
+            if (rec) {
+              decryptedRecords.push(rec);
+            }
+          } catch {}
+        }
+      } finally {
+        if (ownsItemKey) itemKey.fill(0);
+      }
+    }
+  } finally {
+    orgKeys.wipe();
+  }
+
+  return findMatchingPasskeys(decryptedRecords, { rpId, allowedCredentials });
+}
+
 export class VaultUriCache {
   #byUser = new Map();
   #resolveDataFile;
@@ -545,10 +630,13 @@ export class VaultUriCache {
     const orgKeys = createOrgKeyResolver(store, userId, userKeyBuf);
 
     const cipherRules = new Map();
+    const passkeyRpIds = new Map();
 
     try {
       for (const [cipherId, cipher] of Object.entries(ciphersMap)) {
-        if (!isEligiblePasswordCipher(cipher)) continue;
+        const hasPwd = isEligiblePasswordCipher(cipher);
+        const hasPk = isEligiblePasskeyCipher(cipher);
+        if (!hasPwd && !hasPk) continue;
 
         const baseKey = cipher.organizationId ? orgKeys.getOrgKey(cipher.organizationId) : userKeyBuf;
         if (!baseKey) continue;
@@ -566,19 +654,37 @@ export class VaultUriCache {
         if (!itemKey) continue;
 
         try {
-          const rules = [];
-          for (const u of cipher.login.uris) {
-            if (!u?.uri) continue;
-            try {
-              const plainUri = decryptSymString(u.uri, itemKey);
-              const match = u.match ?? defaultMatch;
-              if (isIndexableCipherUri(plainUri, match)) {
-                rules.push({ uri: plainUri, match });
-              }
-            } catch {}
+          if (hasPwd) {
+            const rules = [];
+            for (const u of cipher.login.uris) {
+              if (!u?.uri) continue;
+              try {
+                const plainUri = decryptSymString(u.uri, itemKey);
+                const match = u.match ?? defaultMatch;
+                if (isIndexableCipherUri(plainUri, match)) {
+                  rules.push({ uri: plainUri, match });
+                }
+              } catch {}
+            }
+            if (rules.length > 0) {
+              cipherRules.set(cipherId, rules);
+            }
           }
-          if (rules.length > 0) {
-            cipherRules.set(cipherId, rules);
+
+          if (hasPk) {
+            const rpIds = [];
+            for (const rawFido2 of cipher.login.fido2Credentials) {
+              if (!rawFido2?.rpId) continue;
+              try {
+                const plainRpId = decryptSymString(rawFido2.rpId, itemKey);
+                if (plainRpId) {
+                  rpIds.push(plainRpId.toLowerCase());
+                }
+              } catch {}
+            }
+            if (rpIds.length > 0) {
+              passkeyRpIds.set(cipherId, rpIds);
+            }
           }
         } finally {
           if (ownsItemKey) itemKey.fill(0);
@@ -590,7 +696,9 @@ export class VaultUriCache {
 
     this.#byUser.set(userId, {
       cipherRules,
+      passkeyRpIds,
       savedRules: new Map(),
+      initialized: true,
       lastMtimeMs: mtimeMs,
     });
   }
@@ -599,7 +707,13 @@ export class VaultUriCache {
     if (!userId || !isAutofillEligibleUrl(rawUri)) return;
     let state = this.#byUser.get(userId);
     if (!state) {
-      state = { cipherRules: new Map(), savedRules: new Map(), lastMtimeMs: -1 };
+      state = {
+        cipherRules: new Map(),
+        passkeyRpIds: new Map(),
+        savedRules: new Map(),
+        initialized: false,
+        lastMtimeMs: -1,
+      };
       this.#byUser.set(userId, state);
     }
     const dataFile = this.#resolveDataFile();
@@ -614,10 +728,11 @@ export class VaultUriCache {
   }
 
   #pruneStaleCiphers(userId, state) {
-    if (state.cipherRules.size === 0) return;
+    if (state.cipherRules.size === 0 && state.passkeyRpIds.size === 0) return;
     const dataFile = this.#resolveDataFile();
     if (!dataFile) {
       state.cipherRules.clear();
+      state.passkeyRpIds.clear();
       return;
     }
     let mtimeMs;
@@ -636,8 +751,33 @@ export class VaultUriCache {
           state.cipherRules.delete(cipherId);
         }
       }
+      for (const cipherId of state.passkeyRpIds.keys()) {
+        if (!isEligiblePasskeyCipher(ciphersMap[cipherId])) {
+          state.passkeyRpIds.delete(cipherId);
+        }
+      }
       state.lastMtimeMs = mtimeMs;
     } catch {}
+  }
+
+  isInitialized(userId) {
+    return Boolean(this.#byUser.get(userId)?.initialized);
+  }
+
+  hasPasskeyRpId(userId, rpId) {
+    if (!userId || !rpId) return false;
+    const state = this.#byUser.get(userId);
+    if (!state || !state.initialized) return false;
+
+    this.#pruneStaleCiphers(userId, state);
+
+    const target = String(rpId).toLowerCase();
+    for (const rpIds of state.passkeyRpIds.values()) {
+      if (rpIds.includes(target)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   hasMatch(userId, targetUri) {

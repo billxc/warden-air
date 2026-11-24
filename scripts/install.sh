@@ -16,12 +16,12 @@ else
   trap 'rm -rf "$TMP_DIR"' EXIT
 
   print "Downloading Warden Air host from GitHub..."
-  for file in agent.mjs host.mjs paths.mjs vault.mjs run-host.sh; do
+  for file in agent.mjs host.mjs paths.mjs vault.mjs passkey.mjs run-host.sh; do
     curl -fsSL "$RAW_BASE/host/$file" -o "$TMP_DIR/$file"
   done
 
   mkdir -p "$HOST_DIR"
-  for file in agent.mjs host.mjs paths.mjs vault.mjs run-host.sh; do
+  for file in agent.mjs host.mjs paths.mjs vault.mjs passkey.mjs run-host.sh; do
     mv "$TMP_DIR/$file" "$HOST_DIR/$file"
   done
   chmod +x "$HOST_DIR/run-host.sh" "$HOST_DIR/host.mjs" "$HOST_DIR/agent.mjs"

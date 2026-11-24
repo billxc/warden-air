@@ -15,10 +15,20 @@ import {
   setStoredDesktopSharedKey,
 } from "./paths.mjs";
 import {
+  FallbackRequestedError,
+  WebAuthnError,
+  assertPasskeyCredential,
+  isHardwareOnlyAllowList,
+  resolveOriginAndRpId,
+  resolveUserVerificationRequirement,
+} from "./passkey.mjs";
+import {
   VaultUriCache,
   decryptSymString,
   encryptSymEncString,
+  hasAnyPasskeyInLocalStore,
   isAutofillEligibleUrl,
+  queryLocalPasskeysForRpId,
   queryLocalVaultForUrl,
   readAccountsFromLocalStore,
   resolveBitwardenDataFile,
@@ -643,6 +653,31 @@ function getStatusSnapshot() {
   return { accounts: enriched, active };
 }
 
+function toPasskeyCandidateSummary(rec) {
+  return {
+    credentialId: rec.credentialId,
+    cipherId: rec.cipherId,
+    rpId: rec.rpId,
+    rpName: rec.rpName,
+    userName: rec.userName,
+    userDisplayName: rec.userDisplayName,
+  };
+}
+
+function formatPasskeyError(id, err) {
+  if (err instanceof FallbackRequestedError || err?.fallbackRequested) {
+    return { id, ok: false, fallbackRequested: true };
+  }
+  if (err instanceof WebAuthnError || err instanceof TypeError) {
+    return { id, ok: false, error: err.name, message: err.message };
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg === "biometric_canceled_or_disabled" || msg === "biometric_timeout") {
+    return { id, ok: false, retryable: true, error: "NotAllowedError", message: msg };
+  }
+  return { id, ok: false, error: "NotAllowedError", message: msg };
+}
+
 async function handleAction(req) {
   const { id, action } = req || {};
   try {
@@ -723,6 +758,114 @@ async function handleAction(req) {
           forceCreate: Boolean(req.forceCreate),
         });
         return { id, ok: true, ...result };
+      }
+
+      case "passkeyQuery": {
+        try {
+          const { rpId } = resolveOriginAndRpId(req.origin, req.rpId);
+          resolveUserVerificationRequirement(req.userVerification);
+          if (isHardwareOnlyAllowList(req.allowedCredentials)) {
+            return { id, ok: false, fallbackRequested: true };
+          }
+
+          const { active } = getStatusSnapshot();
+          if (!active) {
+            return { id, ok: false, fallbackRequested: true };
+          }
+
+          const userKey = peekUnlockedKey(active.id);
+          if (!userKey) {
+            const mayHavePasskey = vaultUriCache.isInitialized(active.id)
+              ? vaultUriCache.hasPasskeyRpId(active.id, rpId)
+              : hasAnyPasskeyInLocalStore(active.id);
+            if (!mayHavePasskey) {
+              return { id, ok: false, fallbackRequested: true };
+            }
+            return { id, ok: false, error: "locked", email: active.email };
+          }
+
+          const records = queryLocalPasskeysForRpId(
+            active.id,
+            userKey,
+            rpId,
+            req.allowedCredentials || [],
+          );
+          if (records.length === 0) {
+            return { id, ok: false, fallbackRequested: true };
+          }
+          return {
+            id,
+            ok: true,
+            email: active.email,
+            candidates: records.map(toPasskeyCandidateSummary),
+          };
+        } catch (err) {
+          return formatPasskeyError(id, err);
+        }
+      }
+
+      case "passkeyAssert": {
+        try {
+          const { origin, rpId } = resolveOriginAndRpId(req.origin, req.rpId);
+          resolveUserVerificationRequirement(req.userVerification);
+          if (isHardwareOnlyAllowList(req.allowedCredentials)) {
+            return { id, ok: false, fallbackRequested: true };
+          }
+
+          const { active } = getStatusSnapshot();
+          if (!active) {
+            return { id, ok: false, fallbackRequested: true };
+          }
+
+          let userKey = peekUnlockedKey(active.id);
+          if (!userKey) {
+            userKey = await bridge.unlockWithTouchId(active.id);
+          }
+
+          const records = queryLocalPasskeysForRpId(
+            active.id,
+            userKey,
+            rpId,
+            req.allowedCredentials || [],
+          );
+          if (records.length === 0) {
+            wipeAllKeys();
+            return { id, ok: false, fallbackRequested: true };
+          }
+
+          if (!req.selectedCredentialId && records.length > 1) {
+            return {
+              id,
+              ok: true,
+              email: active.email,
+              candidates: records.map(toPasskeyCandidateSummary),
+            };
+          }
+
+          try {
+            const asserted = assertPasskeyCredential(
+              {
+                origin,
+                rpId,
+                challenge: req.challenge,
+                sameOriginWithAncestors: Boolean(req.sameOriginWithAncestors),
+                allowedCredentials: req.allowedCredentials || [],
+                userVerification: req.userVerification,
+              },
+              {
+                existingRecords: records,
+                selectedCredentialId: req.selectedCredentialId || null,
+                userVerified: true,
+                readOnlyVault: true,
+              },
+            );
+            return { id, ok: true, email: active.email, result: asserted.assertion };
+          } finally {
+            wipeAllKeys();
+          }
+        } catch (err) {
+          return formatPasskeyError(id, err);
+        }
       }
 
       default:

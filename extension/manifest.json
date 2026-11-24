@@ -24,6 +24,19 @@
   },
   "content_scripts": [
     {
+      "matches": ["https://*/*", "http://localhost/*"],
+      "js": ["passkey-page.js"],
+      "world": "MAIN",
+      "all_frames": true,
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://*/*", "http://localhost/*"],
+      "js": ["passkey-content.js"],
+      "all_frames": true,
+      "run_at": "document_start"
+    },
+    {
       "matches": ["https://*/*", "http://*/*"],
       "js": ["content.js"],
       "all_frames": true,
